@@ -44,8 +44,8 @@ In the current version, the program may slow down with files larger than 10 thou
 
 ## Examples
 
-There are several example data files for testing the application in the 'data' folder.
-Type `protoedit filename.pb` to open a file (or `cargo run --release -- data/filename.pb`).
+There are several example data files for testing the application in the 'resources' folder.
+Type `protoedit filename.pb` to open a file (or `cargo run --release -- resources/filename.pb`).
 
  * ints.pb - simple integer data example
  * str.pb - multiline string example

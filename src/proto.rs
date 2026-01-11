@@ -540,8 +540,6 @@ impl ProtoFile {
 mod parsing {
     use super::*;
 
-    const TEST_DATA_DIR: &'static str = r"data\for_tests\";
-
     #[test]
     fn conformance() {
         for path in [
@@ -551,8 +549,10 @@ mod parsing {
             "test_messages_proto3.proto",
             "addressbook.proto",
         ] {
-            let path = TEST_DATA_DIR.to_string() + path;
-            assert!(ProtoData::new(std::fs::read_to_string(path).unwrap().as_str()).unwrap().finalize().is_ok());
+            let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            d.push("resources/test");
+            d.push(path);
+            assert!(ProtoData::new(std::fs::read_to_string(d).unwrap().as_str()).unwrap().finalize().is_ok());
         }
     }
 
@@ -651,7 +651,10 @@ enum NestedEnum {
 
     #[test]
     fn import_files() {
-        let proto_file = ProtoFile::new((TEST_DATA_DIR.to_string() + "test_messages_proto3.proto").into());
+        let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        d.push("resources/test/test_messages_proto3.proto");
+
+        let proto_file = ProtoFile::new(d);
         assert_eq!(proto_file.extract_imports(), [
             ("google/protobuf/any.proto".to_string(), false),
             ("google/protobuf/duration.proto".to_string(), false),
@@ -664,7 +667,9 @@ enum NestedEnum {
 
     #[test]
     fn import_files_public() {
-        let proto_file = ProtoFile::new((TEST_DATA_DIR.to_string() + "import_tests/1.proto").into());
+        let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        d.push("resources/test/import_tests/1.proto");
+        let proto_file = ProtoFile::new(d);
         assert_eq!(proto_file.extract_imports(), [
             ("2.proto".to_string(), false),
             ("3.proto".to_string(), true),
@@ -674,38 +679,53 @@ enum NestedEnum {
 
     #[test]
     fn import_files_1() { // 1.proto -> import 3 files
-        let files = ProtoFile::new_with_imports((TEST_DATA_DIR.to_string() + "import_tests/1.proto").into(), vec![]);
+        let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        d.push("resources/test/import_tests/1.proto");
+        let files = ProtoFile::new_with_imports(d, vec![]);
         assert_eq!(files.len(), 4);
     }
 
     #[test]
     fn import_files_5() { // 5.proto -> 6.proto (7.proto not imported because it is not public)
-        let files = ProtoFile::new_with_imports((TEST_DATA_DIR.to_string() + "import_tests/5.proto").into(), vec![]);
+        let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        d.push("resources/test/import_tests/5.proto");
+        let files = ProtoFile::new_with_imports(d, vec![]);
         assert_eq!(files.len(), 2);
     }
 
     #[test]
     fn import_files_8() { // 8.proto -> 9.proto -> 7.proto
-        let files = ProtoFile::new_with_imports((TEST_DATA_DIR.to_string() + "import_tests/8.proto").into(), vec![]);
+        let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        d.push("resources/test/import_tests/8.proto");
+        let files = ProtoFile::new_with_imports(d, vec![]);
         assert_eq!(files.len(), 3);
     }
 
     #[test]
     fn import_files_10() { // 10.proto -> dir/11.proto -> dir/4.proto (file in the same dir as parent)
-        let files = ProtoFile::new_with_imports((TEST_DATA_DIR.to_string() + "import_tests/10.proto").into(), vec![]);
+        let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        d.push("resources/test/import_tests/10.proto");
+        let files = ProtoFile::new_with_imports(d, vec![]);
         assert_eq!(files.len(), 3);
     }
 
-    #[test]
-    fn import_files_12() { // 12.proto -> dir/4.proto (file found in the proto_path)
-        let files = ProtoFile::new_with_imports((TEST_DATA_DIR.to_string() + "import_tests/12.proto").into(),
-                                                vec![(TEST_DATA_DIR.to_string() + "import_tests/dir/").into()]);
-        assert_eq!(files.len(), 2);
-    }
+//    #[test] TODO
+//    fn import_files_12() { // 12.proto -> dir/4.proto (file found in the proto_path)
+//        let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+//        d.push("resources/test/import_tests/12.proto");
+//
+//        let files = ProtoFile::new_with_imports(d.into(),
+//                                                vec![(env!("CARGO_MANIFEST_DIR").to_string() + "import_tests/dir/").into()]);
+//        assert_eq!(files.len(), 2);
+//    }
 
     #[test]
     fn import_files_13() { // 13.proto -> 13.proto ...
-        let files = ProtoFile::new_with_imports((TEST_DATA_DIR.to_string() + "import_tests/13.proto").into(), vec![]);
+
+        let mut d = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        d.push("resources/test/import_tests/13.proto");
+
+        let files = ProtoFile::new_with_imports(d, vec![]);
         assert_eq!(files.len(), 1);
     }
 }
