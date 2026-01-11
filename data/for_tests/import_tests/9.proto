@@ -1,0 +1,5 @@
+
+import public "7.proto";
+
+message M9 {
+}

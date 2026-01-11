@@ -1,0 +1,5 @@
+
+import "dir/11.proto";
+
+message M10 {
+}

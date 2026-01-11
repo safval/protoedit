@@ -1,0 +1,5 @@
+
+import "6.proto";
+
+message M5 {
+}

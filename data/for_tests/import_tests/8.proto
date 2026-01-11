@@ -1,0 +1,5 @@
+
+import "9.proto";
+
+message M8 {
+}

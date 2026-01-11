@@ -1,0 +1,7 @@
+
+import "2.proto";
+import public "3.proto";
+import	"dir/4.proto";
+
+message M1 {
+}

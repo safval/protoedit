@@ -540,7 +540,7 @@ impl ProtoFile {
 mod parsing {
     use super::*;
 
-    const TEST_DATA_DIR: &'static str = r"C:\V\prj\rust\p18089\test-data-maker\data\";
+    const TEST_DATA_DIR: &'static str = r"data\for_tests\";
 
     #[test]
     fn conformance() {
