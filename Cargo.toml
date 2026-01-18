@@ -2,6 +2,12 @@
 name = "protoedit"
 version = "0.8.1"
 edition = "2021"
+license = "MIT"
+description = "Terminal-based protobuf data files editor"
+repository = "https://github.com/safval/protoedit"
+readme = "README.md"
+keywords = ["terminal", "protobuf"]
+categories = ["text-editors", "data-structures", "development-tools", "command-line-utilities"]
 
 [dependencies]
 clap = { version = "4.5.35", features = ["derive"] }
