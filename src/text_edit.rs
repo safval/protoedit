@@ -14,7 +14,7 @@ enum LastPageLines {
     #[default]
     Unspecified, // scroll is not allowed if it will show empty page
     OneBlank,    // scroll stop after first blank line appears
-    OneNotBlank, // scrool stop when all lines except one are blank
+    OneNotBlank, // scroll stop when all lines except one are blank
 }
 
 #[derive(Debug)]

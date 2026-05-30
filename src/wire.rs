@@ -283,7 +283,7 @@ impl<'proto> MessageData {
         while *limit > 0 {
             let mut tag = reader.read_tag(limit)?;
             match def.get_field(tag.field_id()) {
-                Some(field_def) => { // read sumbessage field
+                Some(field_def) => { // read submessage field
                     if field_def.is_message() {
                         *limit -= tag.length;
                         let submsg_def = proto.get_message_definition(&field_def.typename()).unwrap();

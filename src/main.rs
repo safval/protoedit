@@ -161,7 +161,7 @@ impl App {
         self.need_update = true;
     }
     fn after_event(&mut self) -> io::Result<()> {
-        if self.need_update_layout_height { // after show/hidde comment for example
+        if self.need_update_layout_height { // after show/hide comment for example
             self.layouts.update_layouts(&self.data, &self.layout_config);
             self.need_update_layout_height = false;
             self.need_update = true;
@@ -805,7 +805,7 @@ message M2 { int32 i2 = 2; int32 i3 = 3; }
 
     #[test]
     fn match_testing_requirements() {
-        // these settings values required for correct test data formating
+        // these settings values required for correct test data formatting
         assert_eq!(MARGIN_LEFT, 1);
         assert_eq!(MARGIN_RIGHT, 1);
     }

@@ -69,7 +69,7 @@ pub enum UserCommand
     //ExportData,
     //ImportData,
     // hotkey 'S', when selected column name of a repeated message in table mode
-    // sort table by this column по (a...z|z...a|as read from file)
+    // sort table by this column (a...z|z...a|as read from file)
     SortDataView,
     // not a command, just key pressed
     KeyPress(char),
