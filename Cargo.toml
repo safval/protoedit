@@ -14,3 +14,4 @@ clap = { version = "4.5.35", features = ["derive"] }
 crossterm = "0.28.1"
 pest = "2.7.15"
 pest_derive = "2.7.15"
+unicode-width = "0.2.2"

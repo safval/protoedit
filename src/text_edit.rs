@@ -7,6 +7,7 @@
 #![allow(warnings)]
 use std::cell::RefCell;
 use std::cmp::Ordering;
+use unicode_width::UnicodeWidthChar;
 
 // when scrolling down should stop
 #[derive(PartialEq, Default, Debug)]
@@ -272,12 +273,24 @@ fn text_2dto1d() {
     assert_eq!(tl.to1d(&cfg, (3, 3)), 7);
 }
 
-// how long the char in screen
+// how many terminal columns the char occupies on screen
 fn get_char_width(cfg: &TextConfig, c: char) -> u8 {
     match c {
+        // Tab width is a display/config choice, not an intrinsic property of the char.
         '\t' => cfg.tab_width,
-        '🌏' | '✔' => 2, // todo handle others
-        _ => 1,
+        // UnicodeWidthChar implements Unicode Annex #11 (East Asian Width): 0 for
+        // combining/zero-width marks, 1 for normal chars, 2 for wide ones (CJK, many
+        // emoji). It returns None for control characters, which we render as a single
+        // column to stay consistent with the previous behavior.
+        //
+        // Caveat: "East Asian Ambiguous" characters (e.g. '✔' U+2714) have no fixed
+        // width — it depends on the terminal/font. UnicodeWidthChar::width() resolves
+        // them to 1 (the Unicode default for non-CJK context), but some terminals render
+        // them as 2 (observed in Windows cmd.exe and Far Manager). There is no portable
+        // way to know without asking the terminal itself (print the glyph, then read the
+        // cursor column via crossterm's cursor::position()). Use width_cjk() instead if
+        // ambiguous chars should be treated as wide.
+        _ => UnicodeWidthChar::width(c).unwrap_or(1) as u8,
     }
 }
 
