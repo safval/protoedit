@@ -165,8 +165,9 @@ impl TextLines {
 
         let mut x = 0;
 
-        //for c in self.text[starts[row].0..starts[row].0 + col].chars() {
-        for c in self.text.chars().skip(row).take(col) {
+        // `col` is a byte offset within the line; because positions are always on a
+        // char boundary, `starts[row].0 + col` is a valid char boundary to slice at.
+        for c in self.text[starts[row].0..starts[row].0 + col].chars() {
             x += get_char_width(cfg, c) as usize;
         }
 
@@ -182,22 +183,42 @@ impl TextLines {
         let line_start = *starts.get(pos.1).unwrap_or(starts.last().unwrap());
         let scan_end = *starts.get(pos.1 + 1).unwrap_or(&(self.text.len(), false));
 
-        //println!(            "pos:{:?}, line_start:{line_start}, scan_end:{scan_end}",            pos        );
-        //print!("x: ");
         let mut x = 0;
-        let mut res = line_start;
+        let mut res = line_start.0;
         if scan_end.0 > line_start.0 {
-            for c in self.text[line_start.0..(scan_end.0 - 1)].chars() {
+            // Exclude the final char of the scanned range: for a hard line break it is
+            // the trailing '\n', and for any line it keeps the cursor from landing past
+            // the last char. Dropping a whole char (not one byte) stays on a boundary.
+            let mut end = scan_end.0;
+            if let Some(last) = self.text[line_start.0..scan_end.0].chars().next_back() {
+                end -= last.len_utf8();
+            }
+            for c in self.text[line_start.0..end].chars() {
                 x += get_char_width(cfg, c) as usize;
-                //print!("{x} ");
                 if x > pos.0 {
                     break;
                 }
-                res.0 += 1;
+                res += c.len_utf8();
             }
         }
-        //println!(" res:{res}");
-        res.0
+        res
+    }
+
+    // byte range [start, end) of the visual line containing `pos`, with any trailing
+    // '\n' excluded. Used to keep horizontal cursor movement within a single line.
+    pub fn line_bounds(&self, cfg: &TextConfig, pos: usize) -> (usize, usize) {
+        self.update_starts(cfg, self.window_width);
+        let starts = self.starts.borrow();
+        let row = match starts.binary_search_by(|item| item.0.cmp(&pos)) {
+            Ok(r) => r,
+            Err(r) => r - 1,
+        };
+        let line_start = starts[row].0;
+        let mut line_end = starts.get(row + 1).map_or(self.text.len(), |s| s.0);
+        if line_end > line_start && self.text.as_bytes()[line_end - 1] == b'\n' {
+            line_end -= 1;
+        }
+        (line_start, line_end)
     }
 }
 
@@ -488,15 +509,8 @@ fn scroll_five_lines() {
 
 impl TextChange {
     pub fn apply(&self, text: &mut String) {
-        let mut s1: String = text.chars().take(self.at).collect();
-
-        println!("TextChange: {:?}", self);
-
-        s1 += &self.after;
-        s1 += &text.chars().skip(self.at + self.before.len()).collect::<String>();
-
-        //        text.replace_range(self.at..self.at + self.before.len(), &self.after);
-        *text = s1; // + &s2;
+        // `at` and `before` are byte offsets/lengths, so this slices on char boundaries.
+        text.replace_range(self.at..self.at + self.before.len(), &self.after);
     }
 }
 
@@ -509,17 +523,16 @@ impl TextSelection {
         }
     }
     pub fn on_char(&mut self, text: &String, c: char) -> TextChange {
-        let before = if self.len == 0 {
-            self.pos += 1;
-            String::new()
+        let (at, before) = if self.len == 0 {
+            (self.pos, String::new())
         } else {
             let (start, finish) = self.selected_range();
-            self.pos = start + 1;
             self.len = 0;
-            text[start..finish].to_string()
+            (start, text[start..finish].to_string())
         };
+        self.pos = at + c.len_utf8();
         TextChange {
-            at: self.pos - 1,
+            at,
             before,
             after: c.into(),
         }
@@ -528,30 +541,36 @@ impl TextSelection {
     pub fn on_delete(&mut self, text: &String, backspace: bool) -> Option<TextChange> {
         if self.len != 0 {
             let (start, finish) = self.selected_range();
-            self.pos = start + 1;
+            self.pos = start;
             self.len = 0;
             Some(TextChange {
-                at: self.pos - 1,
+                at: start,
                 before: text[start..finish].to_string(),
                 after: String::new(),
             })
-        } else {
-            let at: usize = if !backspace {
-                if self.pos >= text.len() {
-                    return None;
-                }
-                self.pos
-            } else {
-                if self.pos == 0 {
-                    return None;
-                }
-                self.pos -= 1;
-                self.pos
-            };
-
+        } else if !backspace {
+            if self.pos >= text.len() {
+                return None;
+            }
+            // delete the whole char at the cursor, not a single byte
+            let ch = text[self.pos..].chars().next().unwrap();
+            let end = self.pos + ch.len_utf8();
             Some(TextChange {
-                at,
-                before: text[at..=at].to_string(),
+                at: self.pos,
+                before: text[self.pos..end].to_string(),
+                after: String::new(),
+            })
+        } else {
+            if self.pos == 0 {
+                return None;
+            }
+            // step back over the whole char preceding the cursor
+            let ch = text[..self.pos].chars().next_back().unwrap();
+            self.pos -= ch.len_utf8();
+            let end = self.pos + ch.len_utf8();
+            Some(TextChange {
+                at: self.pos,
+                before: text[self.pos..end].to_string(),
                 after: String::new(),
             })
         }
@@ -565,54 +584,24 @@ impl TextSelection {
             return;
         }
 
-        let (mut x, y) = text_lines.to2d(cfg, self.pos);
-
-        let text_bytes = text_lines.text.as_bytes();
-
-        //        println!("x={x}; delta={delta}");
-        //
+        // Step horizontally over whole characters, working directly in byte offsets and
+        // clamping to the current visual line (matching the previous fixed-row behavior).
+        let text = &text_lines.text;
+        let (line_start, line_end) = text_lines.line_bounds(cfg, self.pos);
+        let mut new_pos = self.pos;
         if delta >= 0 {
-            //            x += delta as usize;
-
-            let text_bytes_len = text_bytes.len();
-            while delta > 0 {
-                for i in 0..4 {
-                    let is_char_end = 0xc0 != (text_bytes[x] & 0xc0);
-                    x += 1;
-                    if x >= text_bytes_len {
-                        x = text_bytes_len - 1;
-                        break;
-                    }
-                    if is_char_end { break; }
-                }
-                //                println!(" {} ", x);
+            while delta > 0 && new_pos < line_end {
+                let ch = text[new_pos..].chars().next().unwrap();
+                new_pos += ch.len_utf8();
                 delta -= 1;
             }
-
-        //            println!("x = {}",x);
-
         } else {
-            if x >= -delta as usize {
-                                x -= -delta as usize;
-
-// TODO                x -= 1;
-// TODO                while delta > 0 {
-// TODO                    for i in 0..4 {
-// TODO                        if x == 0 { break; }
-// TODO                        x -= 1;
-// TODO                        let is_char_end = 0xc0 != (text_bytes[x] & 0xc0);
-// TODO                        if is_char_end {
-// TODO                            x += 1;
-// TODO                            break;
-// TODO                        }
-// TODO                    }
-// TODO                    //                println!(" {} ", x);
-// TODO                    delta -= 1;
-// TODO                }
-            } else { x = 0 }
+            while delta < 0 && new_pos > line_start {
+                let ch = text[..new_pos].chars().next_back().unwrap();
+                new_pos -= ch.len_utf8();
+                delta += 1;
+            }
         }
-
-        let new_pos = text_lines.to1d(cfg, (x, y));
 
         if select {
             let delta_pos = new_pos as isize - self.pos as isize;
@@ -702,11 +691,6 @@ impl TextEditor {
         for sel in &mut self.selected {
             let change = sel.on_char(&self.view.lines.text, c);
             sel.x_pref = self.view.lines.to2d(cfg, sel.pos).0;
-
-
-            println!("col: {:?}", change);
-            println!("text: {:?}", self.view.lines.text);
-
 
             change.apply(&mut self.view.lines.text);
             inserted.push(change.after.len());
@@ -836,24 +820,20 @@ fn delete_char() {
     assert_eq!(edit.view.lines.text, "34567");
 }
 
-// TODO #[test]
-// TODO fn delete_unicode_text() { //
-// TODO     let mut edit = TextEditor::new("абв".into(), 80, 24);
-// TODO     let cfg = TextConfig::default();
-// TODO
-// TODO     println!("{:x?}", edit.view.lines.text.as_bytes());
-// TODO
-// TODO     edit.on_move_x(&cfg, 3, false);
-// TODO
-// TODO     println!("222222");
-// TODO
-// TODO     edit.on_delete(&cfg, true);
-// TODO     assert_eq!(edit.view.lines.text, "аб");
-// TODO         edit.on_delete(&cfg, true);
-// TODO         assert_eq!(edit.view.lines.text, "а");
-// TODO         edit.on_delete(&cfg, true);
-// TODO         assert_eq!(edit.view.lines.text, "");
-// TODO }
+#[test]
+fn delete_unicode_text() {
+    let mut edit = TextEditor::new("абв".into(), 80, 24);
+    let cfg = TextConfig::default();
+
+    edit.on_move_x(&cfg, 3, false);
+
+    edit.on_delete(&cfg, true);
+    assert_eq!(edit.view.lines.text, "аб");
+    edit.on_delete(&cfg, true);
+    assert_eq!(edit.view.lines.text, "а");
+    edit.on_delete(&cfg, true);
+    assert_eq!(edit.view.lines.text, "");
+}
 
 
 #[test]
