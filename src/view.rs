@@ -96,6 +96,9 @@ pub struct Layouts { // rename Document
     pub proto: ProtoData,
     pub indents: Vec<u16>,
     pub top_layouts_count: usize,
+    // the document is a stream of length-delimited records (--delimited),
+    // saving must write the varint length prefixes back
+    pub delimited: bool,
 }
 
 pub struct LayoutParams {
@@ -1375,7 +1378,7 @@ impl Layouts {
 
         let top_layouts_count = Self::calc_top_layouts_count(&items);
 
-        Layouts { items, proto, file_path, indents: negotiator.level_indents, scroll: 0, top_layouts_count, width, height }
+        Layouts { items, proto, file_path, indents: negotiator.level_indents, scroll: 0, top_layouts_count, width, height, delimited: false }
     }
 
     pub fn file_name(&self) -> String {
@@ -1387,7 +1390,11 @@ impl Layouts {
         temp_path.set_extension("tmp");
         {
             let mut output = std::fs::File::create(temp_path.clone())?;
-            data.write(&mut output, &self.proto, data.def.clone())?;
+            if self.delimited {
+                data.write_delimited(&mut output, &self.proto)?;
+            } else {
+                data.write(&mut output, &self.proto, data.def.clone())?;
+            }
             output.flush()?;
         }
         std::fs::rename(temp_path, self.file_path.clone())?;

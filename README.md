@@ -12,6 +12,15 @@ Current version works as viewer, not all data type editable yet.
  * format.proto - path to .proto file with data description
  * message_name - name of the root message in .proto (optional)
 
+Options:
+
+ * `-d`/`--delimited` - the data file is a stream of length-delimited records: a varint
+   byte-length prefix before each message, the framing written by `writeDelimitedTo` (Java),
+   `SerializeDelimitedToOstream` (C++) and `pb_encode_delimited` (nanopb). The records are
+   shown as repeated fields of one hidden wrapper message, and saving writes the length
+   prefixes back.
+ * `-I`/`--proto_path <dir>` - directories for resolving `import`ed proto files (absolute paths)
+
 ## Hotkeys
 
 Up/Down - Navigate lines

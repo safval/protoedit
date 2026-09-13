@@ -83,7 +83,7 @@ struct App {
 }
 
 impl App {
-    pub fn new(data: MessageData, proto: ProtoData, file_name: PathBuf) -> io::Result<App> {
+    pub fn new(data: MessageData, proto: ProtoData, file_name: PathBuf, delimited: bool) -> io::Result<App> {
         let mut stdout = io::stdout();
         crossterm::terminal::enable_raw_mode()?;
         if (USE_ALTERNATIVE_SCREEN) { stdout.execute(EnterAlternateScreen)?; }
@@ -101,6 +101,7 @@ impl App {
         }
 
         let mut layouts = Layouts::new(&data, proto, &layout_config, file_name, width, height - TOP_LINE);
+        layouts.delimited = delimited;
         layouts.ensure_loaded(&data, &layout_config, 0, 0, height as usize, &mut Selection::default());
         let mut app = App {
             stdout,
@@ -555,6 +556,12 @@ struct Args {
     /// Set of directories for proto files search
     #[arg(short = 'I', long = "proto_path")]
     proto_path: Vec<PathBuf>,
+
+    /// The data file is a stream of length-delimited records (a varint length prefix
+    /// before each message, as written by writeDelimitedTo / pb_encode_delimited)
+    /// instead of a single message
+    #[arg(short = 'd', long = "delimited")]
+    delimited: bool,
 }
 
 
@@ -624,9 +631,14 @@ fn main() -> io::Result<()> {
     let file = std::fs::File::open(binary_file)?;
     let mut limit = file.metadata()?.len() as u32;
     let mut reader = PbReader::new(file);
-    let data = MessageData::new(&mut reader, &proto, root_msg.unwrap(), &mut limit)?;
+    let data = if args.delimited {
+        MessageData::new_delimited(&mut reader, &proto, root_msg.unwrap(), &mut limit)?
+    } else {
+        MessageData::new(&mut reader, &proto, root_msg.unwrap(), &mut limit).map_err(|e|
+            io::Error::new(e.kind(), format!("{} (if the file is a stream of length-delimited messages, try --delimited)", e)))?
+    };
 
-    App::new(data, proto, binary_file.into())?.run()
+    App::new(data, proto, binary_file.into(), args.delimited)?.run()
 }
 
 

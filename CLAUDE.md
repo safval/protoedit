@@ -26,6 +26,7 @@ A single positional argument, semicolon-separated: `data.pb;format.proto;message
 - Only `data.pb` is required. If the `.proto` is omitted it defaults to the data file's name with a `.proto` extension.
 - If `message_name` (the root message) is omitted, it is auto-detected via `ProtoData::auto_detect_root_message()` (the one message type not used as a field of any other).
 - `-I`/`--proto_path <dir>` adds directories for resolving `import`ed proto files (must be absolute paths).
+- `-d`/`--delimited` reads the data file as a stream of length-delimited records (varint length prefix before each message, the `writeDelimitedTo`/`pb_encode_delimited` framing). The records become a repeated field of a hidden wrapper message synthesized by `ProtoData::make_delimited_wrapper`; `MessageData::new_delimited`/`write_delimited` handle the framing, and `Layouts.delimited` makes saving write the prefixes back.
 
 `resources/` holds example `.pb`/`.proto` pairs (`ints`, `str`, `bytes`, `mega`, `test_data_1`) for manual testing.
 

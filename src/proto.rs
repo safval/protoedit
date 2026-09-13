@@ -300,6 +300,23 @@ impl ProtoData {
         }
     }
 
+    // Synthesize a hidden message that holds the records of a length-delimited stream
+    // (--delimited mode) as one repeated field, so that the rest of the program sees
+    // a normal message. The wrapper is not registered in `messages`: nothing looks it
+    // up by name, it is only ever reached through the root MessageData's `def`.
+    // Must be called after finalize() so the record message itself is already linked.
+    pub fn make_delimited_wrapper(record: MessageProtoPtr) -> MessageProtoPtr {
+        let field = EnumOrMessageFieldDefinition::new(
+            CommonFieldProto { name: record.name.clone(), id: 1, repeated: true, ..Default::default() },
+            record.name.clone());
+        field.is_message.set(record.clone()).unwrap_or_else(|_| unreachable!());
+        Rc::new(MessageProto {
+            name: format!("{} stream", record.name),
+            fields: vec![Rc::new(field)],
+            comment: record.comment.clone(),
+        })
+    }
+
     //    fn link_user_types(&mut self) {
     //        for msg in &self.messages {
     //            for field in &msg.fields {

@@ -321,6 +321,45 @@ impl<'proto> MessageData {
         Ok(MessageData { fields, def })
     }
 
+    // Read a stream of length-delimited records: a varint byte-length prefix before each
+    // message, the framing of protobuf's writeDelimitedTo / nanopb's pb_encode_delimited.
+    // The prefix is not part of the wire format proper, so the records are collected into
+    // a synthesized wrapper message (one repeated field) and shown as a normal message.
+    pub fn new_delimited(reader: &mut dyn PbReaderTrait, proto: &'proto ProtoData, record_def: MessageProtoPtr, limit: &mut u32) -> io::Result<Self> {
+        let def = ProtoData::make_delimited_wrapper(record_def.clone());
+        let field_def = def.fields[0].clone();
+        let mut fields = Vec::<FieldData>::new();
+        while *limit > 0 {
+            let prefix = reader.read_varint(limit)?;
+            if prefix < 0 || prefix as u128 > *limit as u128 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof,
+                    format!("record {} is truncated: length prefix is {} but only {} bytes left", fields.len() + 1, prefix, *limit)));
+            }
+            let mut record_limit = prefix as u32;
+            *limit -= record_limit;
+            fields.push(FieldData {
+                def: field_def.clone(),
+                pos: reader.pos(),
+                value: FieldValue::MESSAGE(MessageData::new(reader, proto, record_def.clone(), &mut record_limit)?),
+            });
+        }
+        Ok(MessageData { fields, def })
+    }
+
+    // counterpart of new_delimited: write each record back with its varint length prefix
+    pub fn write_delimited(&self, writer: &mut dyn io::Write, proto: &'proto ProtoData) -> io::Result<()> {
+        for field in &self.fields {
+            if let FieldValue::MESSAGE(msg) = &field.value {
+                // measure the record in a temporary buffer, the prefix must come first
+                let mut buf = vec![];
+                msg.write(&mut buf, proto, msg.def.clone())?;
+                CommonFieldProto::write_varint(writer, buf.len() as i128)?;
+                CommonFieldProto::write_len(writer, &buf)?;
+            } else { unreachable!("delimited stream holds only message records") }
+        }
+        Ok(())
+    }
+
     //fn find_duplicated_fields(fields: &Vec::<(&dyn FieldDefinition, usize, FieldValue)>) -> HashSet<usize> {
     //    let mut ignore = vec![];
     //    if !fields.is_empty() {
@@ -898,6 +937,111 @@ bytes f_bytes = 60;
         let mut output = Vec::new();
         data.write(&mut output, &proto, root_msg).unwrap();
         assert_eq!(output, binary_input);
+    }
+
+    fn event_log_proto() -> &'static str {
+        r#"
+syntax = "proto3";
+message Event {
+  int64 unix_time = 1;
+  oneof kind {
+    LogOpened log_opened = 2;
+    ScreenOn screen_on = 3;
+    Shutdown shutdown = 5;
+  }
+}
+message LogOpened { uint32 format_version = 1; }
+message ScreenOn { }
+message Shutdown { }
+"#
+    }
+
+    #[test]
+    fn delimited_stream() {
+        // three Event records, each preceded by a varint byte-length prefix
+        // (writeDelimitedTo / pb_encode_delimited framing)
+        let binary_input = [
+            0x0A, 0x08, 0xCD, 0xE1, 0x99, 0xD5, 0x06, 0x12, 0x02, 0x08, 0x01, // len 10: unix_time, log_opened { format_version = 1 }
+            0x08, 0x08, 0xCD, 0xE1, 0x99, 0xD5, 0x06, 0x1A, 0x00,             // len 8: unix_time, screen_on { }
+            0x00,                                                             // len 0: empty record
+            0x08, 0x08, 0xDA, 0xE1, 0x99, 0xD5, 0x06, 0x2A, 0x00,             // len 8: unix_time, shutdown { }
+        ];
+
+        let proto = ProtoData::new(event_log_proto()).unwrap().finalize().unwrap();
+        let root_msg = proto.get_message_definition("Event").unwrap();
+        let mut limit = binary_input.len() as u32;
+        let mut read = PbReader::new(binary_input.as_slice());
+        let data = MessageData::new_delimited(&mut read, &proto, root_msg, &mut limit).unwrap();
+
+        let expected = "message Event stream {
+  Event = message Event {
+  unix_time = 1789292749
+  log_opened = message LogOpened {
+  format_version = 1
+}
+
+}
+
+  Event = message Event {
+  unix_time = 1789292749
+  screen_on = message ScreenOn {
+}
+
+}
+
+  Event = message Event {
+}
+
+  Event = message Event {
+  unix_time = 1789292762
+  shutdown = message Shutdown {
+}
+
+}
+
+}
+";
+        assert_eq!(data.to_string(), expected);
+
+        // all records land in one repeated field of the wrapper
+        assert_eq!(data.fields.len(), 4);
+        assert!(data.get_field(&[(1, 3).into()]).is_some());
+        assert!(data.get_field(&[(1, 4).into()]).is_none());
+
+        // byte-exact round trip, including the length prefixes
+        let mut output = Vec::new();
+        data.write_delimited(&mut output, &proto).unwrap();
+        assert_eq!(output, binary_input);
+    }
+
+    #[test]
+    fn delimited_stream_truncated() {
+        // second record claims 8 bytes but the file ends after 2 (torn tail)
+        let binary_input = [
+            0x02, 0x08, 0x01, // len 2: complete record
+            0x08, 0x08, 0x01, // len 8: truncated record
+        ];
+        let proto = ProtoData::new(event_log_proto()).unwrap().finalize().unwrap();
+        let root_msg = proto.get_message_definition("Event").unwrap();
+        let mut limit = binary_input.len() as u32;
+        let mut read = PbReader::new(binary_input.as_slice());
+        let err = MessageData::new_delimited(&mut read, &proto, root_msg, &mut limit).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains("record 2"));
+    }
+
+    #[test]
+    fn delimited_stream_empty_file() {
+        let proto = ProtoData::new(event_log_proto()).unwrap().finalize().unwrap();
+        let root_msg = proto.get_message_definition("Event").unwrap();
+        let mut limit = 0;
+        let mut read = PbReader::new([].as_slice());
+        let data = MessageData::new_delimited(&mut read, &proto, root_msg, &mut limit).unwrap();
+        assert_eq!(data.fields.len(), 0);
+
+        let mut output = Vec::new();
+        data.write_delimited(&mut output, &proto).unwrap();
+        assert!(output.is_empty());
     }
 
     #[test]
