@@ -690,8 +690,6 @@ impl TextEditor {
         let mut inserted = Vec::with_capacity(self.selected.len());
         for sel in &mut self.selected {
             let change = sel.on_char(&self.view.lines.text, c);
-            sel.x_pref = self.view.lines.to2d(cfg, sel.pos).0;
-
             change.apply(&mut self.view.lines.text);
             inserted.push(change.after.len());
             changes.changes.push(change);
@@ -717,6 +715,12 @@ impl TextEditor {
 
         self.history.0.push(changes);
         self.view.lines.starts.replace(vec![]);
+
+        // x_pref must be calculated on the updated text: after inserting '\n'
+        // the cursor stands at the start of a new line, not under the old column
+        for sel in &mut self.selected {
+            sel.x_pref = self.view.lines.to2d(cfg, sel.pos).0;
+        }
     }
 
     pub fn on_delete(&mut self, cfg: &TextConfig, backspace: bool) {
@@ -796,6 +800,65 @@ fn type_over_selection() {
     assert_eq!(edit.view.lines.text, "1x7890");
     edit.on_char(&cfg, 'y');
     assert_eq!(edit.view.lines.text, "1xy7890");
+}
+
+#[test]
+fn type_new_line() {
+    let mut edit = TextEditor::new(String::from("abcd"), 80, 24);
+    let cfg = TextConfig::default();
+    edit.on_move_x(&cfg, 2, false);
+    edit.on_char(&cfg, '\n');
+    assert_eq!(edit.view.lines.text, "ab\ncd");
+    edit.on_char(&cfg, 'x');
+    assert_eq!(edit.view.lines.text, "ab\nxcd");
+}
+
+#[test]
+fn type_new_line_at_the_end() {
+    let mut edit = TextEditor::new(String::from("ab"), 80, 24);
+    let cfg = TextConfig::default();
+    edit.on_move_x(&cfg, 2, false);
+    edit.on_char(&cfg, '\n');
+    assert_eq!(edit.view.lines.text, "ab\n");
+    edit.on_char(&cfg, 'x');
+    assert_eq!(edit.view.lines.text, "ab\nx");
+}
+
+#[test]
+fn move_cursor_after_new_line() {
+    let mut edit = TextEditor::new(String::from("abc\ndef"), 80, 24);
+    let cfg = TextConfig::default();
+    edit.on_move_x(&cfg, 2, false);
+    edit.on_char(&cfg, '\n');
+    assert_eq!(edit.view.lines.text, "ab\nc\ndef");
+    // the cursor is at the start of the new line, so after moving down
+    // it must be at the start of the next line too
+    edit.on_move_y(&cfg, 1, false);
+    edit.on_char(&cfg, 'x');
+    assert_eq!(edit.view.lines.text, "ab\nc\nxdef");
+}
+
+#[test]
+fn new_line_over_selection() {
+    let mut edit = TextEditor::new(String::from("1234567890"), 80, 24);
+    let cfg = TextConfig::default();
+    edit.on_move_x(&cfg, 2, false);
+    edit.on_move_x(&cfg, 3, true);
+    edit.on_char(&cfg, '\n');
+    assert_eq!(edit.view.lines.text, "12\n67890");
+    edit.on_char(&cfg, 'x');
+    assert_eq!(edit.view.lines.text, "12\nx67890");
+}
+
+#[test]
+fn new_line_multi_cursor() {
+    let mut edit = TextEditor::new(String::from("1234567890"), 80, 24);
+    let cfg = TextConfig::default();
+    edit.add_selection(&cfg, 3, 0);
+    edit.on_char(&cfg, '\n');
+    assert_eq!(edit.view.lines.text, "\n123\n4567890");
+    edit.on_char(&cfg, 'x');
+    assert_eq!(edit.view.lines.text, "\nx123\nx4567890");
 }
 
 #[test]

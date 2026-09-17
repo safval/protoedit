@@ -2105,6 +2105,49 @@ message M2 { int32 i2 = 2; int32 i3 = 3; }
     }
 
     #[test]
+    fn enter_key_in_string_editor() {
+        let binary_input = [0x0A, 0x04, 'a' as u8, 'b' as u8, 'c' as u8, 'd' as u8];
+        let proto = ProtoData::new("message M { string f1=1; }").unwrap().finalize().unwrap();
+        let mut limit = binary_input.len() as u32;
+        let root_msg = proto.auto_detect_root_message().unwrap();
+        let mut read = PbReader::new(binary_input.as_slice());
+        let data = MessageData::new(&mut read, &proto, root_msg, &mut limit).unwrap();
+        let mut app = App::for_tests(data, proto, FieldOrder::Proto, 15, 25).unwrap();
+
+        // press right arrow to start edit, then move the cursor after 'ab'
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        assert_eq!(app.to_strings(), [" f1: abcd      ", "cursor: 5,1"]);
+        app.run_command(ScrollHorizontally(2)).unwrap();
+        assert_eq!(app.to_strings(), [" f1: abcd      ", "cursor: 7,1"]);
+
+        // Enter splits the line at the cursor, the cursor moves to the start of the new line
+        app.run_command(CollapsedToggle).unwrap();
+        assert_eq!(app.to_strings(), [" f1: ab        ", "  2: cd        ", "cursor: 5,2"]);
+
+        // typing continues on the new line
+        app.run_command(KeyPress('x')).unwrap();
+        assert_eq!(app.to_strings(), [" f1: ab        ", "  2: xcd       ", "cursor: 6,2"]);
+
+        // Esc closes the editor and applies the change to the data
+        app.run_command(UserCommand::Exit).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [" f1: ab string ", "  2: xcd       "]);
+    }
+
+    #[test]
+    fn enter_key_ignored_in_string_view_mode() {
+        let data = make_one_field_data("message M { string f1=1; }", STR("abc".to_string()));
+        let mut app = App::for_tests(data.0, data.1, FieldOrder::Proto, 50, 25).unwrap();
+        let expected = [" f1: 'abc'                                 string "];
+        assert_eq!(app.to_strings(), expected);
+
+        // without an open editor Enter must not change the string
+        app.run_command(CollapsedToggle).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), expected);
+    }
+
+    #[test]
     fn type_bytes_overwrite() {
         let binary_input = [0x0A, 0x02, 0x01, 0x02];
         let proto = ProtoData::new("message M { bytes f1=1; }").unwrap().finalize().unwrap();

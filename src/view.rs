@@ -877,6 +877,14 @@ impl ViewLayout for StringLayout {
                 } else { CommandResult::None }
             }
 
+            UserCommand::CollapsedToggle => { // Enter key: split the line at the cursor
+                if let Some(edit) = &mut self.edit {
+                    edit.on_char(&config.text_edit_cfg, '\n');
+                    *cursor_pos += 1; // the cursor now on the next screen line
+                    CommandResult::Redraw
+                } else { CommandResult::None }
+            }
+
             UserCommand::Exit => { // on first press Esc exit editor, on the second close app
                 if let Some(edit) = &mut self.edit {
                     let new_field_value = FieldValue::SCALAR(ScalarValue::STR(edit.view.lines.text.clone()));
@@ -1776,35 +1784,38 @@ impl Layouts {
             }
 
             UserCommand::CollapsedToggle => {
-                if let Some(current) = self.items.get(selection.layout) {
-                    if let Some(layout) = &current.layout {
-                        match layout.layout_type() {
-                            LayoutType::Message => {
-                                let current_path = current.path.clone();
-                                let current_amount = current.amount;
-                                // there is no reason to collapse a message that does not exist, it's already displayed in one line
-                                if let Some(msg) = root.get_submessage(&current_path.0) {
-                                    // remove selected layout and all nested layouts
-                                    let path_len = current.path.0.len();
-                                    let mut end_pos = selection.layout + 1;
-                                    while end_pos < self.items.len() {
-                                        let len = self.items[end_pos].path.0.len();
-                                        if len <= path_len { break; }
-                                        end_pos += 1;
-                                    }
-                                    self.items.drain(selection.layout + 1..end_pos);
-                                    // create a collapsed layout in place of the deleted
-                                    self.items[selection.layout] = LayoutParams::new(current_path, current_amount, Box::new(CollapsedLayout { display_size: msg.len() }));
-                                }
+                let layout_type = self.items.get(selection.layout)
+                    .and_then(|current| current.layout.as_ref())
+                    .map(|layout| layout.layout_type());
+                match layout_type {
+                    Some(LayoutType::Message) => {
+                        let current = &self.items[selection.layout];
+                        let current_path = current.path.clone();
+                        let current_amount = current.amount;
+                        // there is no reason to collapse a message that does not exist, it's already displayed in one line
+                        if let Some(msg) = root.get_submessage(&current_path.0) {
+                            // remove selected layout and all nested layouts
+                            let path_len = current_path.0.len();
+                            let mut end_pos = selection.layout + 1;
+                            while end_pos < self.items.len() {
+                                let len = self.items[end_pos].path.0.len();
+                                if len <= path_len { break; }
+                                end_pos += 1;
                             }
-                            LayoutType::Collapsed => {
-                                self.expand_collapsed(root, config, selection.layout);
-                            }
-                            _ => {}
+                            self.items.drain(selection.layout + 1..end_pos);
+                            // create a collapsed layout in place of the deleted
+                            self.items[selection.layout] = LayoutParams::new(current_path, current_amount, Box::new(CollapsedLayout { display_size: msg.len() }));
                         }
+                        CommandResult::Redraw
                     }
+                    Some(LayoutType::Collapsed) => {
+                        self.expand_collapsed(root, config, selection.layout);
+                        CommandResult::Redraw
+                    }
+                    // other layouts may consume Enter themselves (e.g. new line in a string editor)
+                    Some(_) => self.run_active_layout_command(command, root, config, selection),
+                    None => CommandResult::Redraw,
                 }
-                CommandResult::Redraw
             }
             _ => self.run_active_layout_command(command, root, config, selection)
         }
