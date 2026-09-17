@@ -36,7 +36,7 @@ use pest::Lines;
 use crate::proto::{FieldProtoPtr, MessageProto, ProtoData, ProtoFile};
 use crate::typedefs::{PbReader};
 use crate::view::FieldOrder::Proto;
-use crate::view::UserCommand::{ChangeFieldOrder, CollapsedToggle, DeleteData, End, Home, InsertData, ScrollHorizontally, ScrollSibling, ScrollToBottom, ScrollVertically, Exit, KeyPress};
+use crate::view::UserCommand::{ChangeFieldOrder, CollapsedToggle, DeleteData, End, Home, InsertData, ScrollHorizontally, ScrollSibling, ScrollToBottom, ScrollVertically, SelectHorizontally, SelectVertically, SelectHome, SelectEnd, AddCursor, Undo, Redo, Exit, KeyPress};
 use crate::wire::FieldValue::SCALAR;
 
 const USE_ALTERNATIVE_SCREEN: bool = false;
@@ -237,24 +237,44 @@ impl App {
                 },
                 KeyCode::Esc => self.run_command(Exit)?,
                 KeyCode::Enter => self.run_command(CollapsedToggle)?,
-                KeyCode::Up => self.run_command(if event.modifiers.contains(KeyModifiers::CONTROL) { ScrollSibling(-1) } else { ScrollVertically(-1) })?,
-                KeyCode::Down => self.run_command(if event.modifiers.contains(KeyModifiers::CONTROL) { ScrollSibling(1) } else { ScrollVertically(1) })?,
+                KeyCode::Up => self.run_command(
+                    if event.modifiers.contains(KeyModifiers::CONTROL) { ScrollSibling(-1) }
+                    else if event.modifiers.contains(KeyModifiers::ALT | KeyModifiers::SHIFT) { AddCursor(-1) }
+                    else if event.modifiers.contains(KeyModifiers::SHIFT) { SelectVertically(-1) }
+                    else { ScrollVertically(-1) })?,
+                KeyCode::Down => self.run_command(
+                    if event.modifiers.contains(KeyModifiers::CONTROL) { ScrollSibling(1) }
+                    else if event.modifiers.contains(KeyModifiers::ALT | KeyModifiers::SHIFT) { AddCursor(1) }
+                    else if event.modifiers.contains(KeyModifiers::SHIFT) { SelectVertically(1) }
+                    else { ScrollVertically(1) })?,
                 KeyCode::PageUp => self.run_command(ScrollVertically(-((self.height - TOP_LINE - 1) as isize)))?,
                 KeyCode::PageDown => self.run_command(ScrollVertically((self.height - TOP_LINE - 1) as isize))?,
                 KeyCode::Home => if event.modifiers.contains(KeyModifiers::CONTROL) {
                     self.selected = Selection::default();
                     self.need_update = true;
                     false
-                } else { self.run_command(crate::UserCommand::Home)? }
-                KeyCode::End => self.run_command(if event.modifiers.contains(KeyModifiers::CONTROL) { ScrollToBottom } else { End })?,
-                KeyCode::Left => self.run_command(ScrollHorizontally(-1))?,
-                KeyCode::Right => self.run_command(ScrollHorizontally(1))?,
+                } else { self.run_command(if event.modifiers.contains(KeyModifiers::SHIFT) { SelectHome } else { crate::UserCommand::Home })? }
+                KeyCode::End => self.run_command(
+                    if event.modifiers.contains(KeyModifiers::CONTROL) { ScrollToBottom }
+                    else if event.modifiers.contains(KeyModifiers::SHIFT) { SelectEnd }
+                    else { End })?,
+                KeyCode::Left => self.run_command(if event.modifiers.contains(KeyModifiers::SHIFT) { SelectHorizontally(-1) } else { ScrollHorizontally(-1) })?,
+                KeyCode::Right => self.run_command(if event.modifiers.contains(KeyModifiers::SHIFT) { SelectHorizontally(1) } else { ScrollHorizontally(1) })?,
 
                 KeyCode::Delete => self.run_command(DeleteData(false))?,
                 KeyCode::Backspace => self.run_command(DeleteData(true))?,
                 KeyCode::Insert => self.run_command(InsertData)?,
 
-                KeyCode::Char(c) => { self.run_command(KeyPress(c))? }
+                KeyCode::Char(c) => {
+                    if event.modifiers.contains(KeyModifiers::CONTROL) {
+                        match c {
+                            'z' => self.run_command(Undo)?,
+                            'Z' => self.run_command(Redo)?, // Ctrl+Shift+Z
+                            'y' => self.run_command(Redo)?,
+                            _ => self.run_command(KeyPress(c))?,
+                        }
+                    } else { self.run_command(KeyPress(c))? }
+                }
 
                 _ => false
             };
@@ -2132,6 +2152,300 @@ message M2 { int32 i2 = 2; int32 i3 = 3; }
         app.run_command(UserCommand::Exit).unwrap();
         app.after_event().unwrap();
         assert_eq!(app.to_strings(), [" f1: ab string ", "  2: xcd       "]);
+    }
+
+    #[test]
+    fn select_and_delete_in_string_editor() {
+        let binary_input = [0x0A, 0x07, 'a' as u8, 'b' as u8, 'c' as u8, '\n' as u8, 'd' as u8, 'e' as u8, 'f' as u8];
+        let proto = ProtoData::new("message M { string f1=1; }").unwrap().finalize().unwrap();
+        let mut limit = binary_input.len() as u32;
+        let root_msg = proto.auto_detect_root_message().unwrap();
+        let mut read = PbReader::new(binary_input.as_slice());
+        let data = MessageData::new(&mut read, &proto, root_msg, &mut limit).unwrap();
+        let mut app = App::for_tests(data, proto, FieldOrder::Proto, 15, 25).unwrap();
+
+        app.run_command(ScrollHorizontally(1)).unwrap(); // start edit
+        assert_eq!(app.to_strings(), [" f1: abc       ", "  2: def       ", "cursor: 5,1"]);
+
+        // Shift+Right twice selects "ab", Del removes the selection
+        app.run_command(SelectHorizontally(2)).unwrap();
+        assert_eq!(app.to_strings(), [" f1: abc       ", "  2: def       ", "cursor: 7,1"]);
+        app.run_command(DeleteData(false)).unwrap();
+        assert_eq!(app.to_strings(), [" f1: c         ", "  2: def       ", "cursor: 5,1"]);
+
+        // Shift+Down selects "c\n", Del joins the lines
+        app.run_command(SelectVertically(1)).unwrap();
+        assert_eq!(app.to_strings(), [" f1: c         ", "  2: def       ", "cursor: 5,2"]);
+        app.run_command(DeleteData(false)).unwrap();
+        assert_eq!(app.to_strings(), [" f1: def       ", "cursor: 5,1"]);
+
+        // Esc closes the editor and applies the change to the data
+        app.run_command(UserCommand::Exit).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [" f1: de string ", "   : f         "]);
+    }
+
+    #[test]
+    fn shift_home_end_selection_in_string_editor() {
+        let binary_input = [0x0A, 0x07, 'a' as u8, 'b' as u8, 'c' as u8, '\n' as u8, 'd' as u8, 'e' as u8, 'f' as u8];
+        let proto = ProtoData::new("message M { string f1=1; }").unwrap().finalize().unwrap();
+        let mut limit = binary_input.len() as u32;
+        let root_msg = proto.auto_detect_root_message().unwrap();
+        let mut read = PbReader::new(binary_input.as_slice());
+        let data = MessageData::new(&mut read, &proto, root_msg, &mut limit).unwrap();
+        let mut app = App::for_tests(data, proto, FieldOrder::Proto, 15, 25).unwrap();
+
+        app.run_command(ScrollHorizontally(1)).unwrap(); // start edit
+        assert_eq!(app.to_strings(), [" f1: abc       ", "  2: def       ", "cursor: 5,1"]);
+
+        // Shift+End selects to the end of the line only, not the whole text
+        app.run_command(SelectEnd).unwrap();
+        assert_eq!(app.to_strings(), [" f1: abc       ", "  2: def       ", "cursor: 8,1"]);
+
+        // typing replaces the selection
+        app.run_command(KeyPress('x')).unwrap();
+        assert_eq!(app.to_strings(), [" f1: x         ", "  2: def       ", "cursor: 6,1"]);
+
+        // Shift+Home selects backward to the start of the line, Del removes it
+        app.run_command(SelectHome).unwrap();
+        assert_eq!(app.to_strings(), [" f1: x         ", "  2: def       ", "cursor: 5,1"]);
+        app.run_command(DeleteData(false)).unwrap();
+        assert_eq!(app.to_strings(), [" f1:           ", "  2: def       ", "cursor: 5,1"]);
+    }
+
+    #[test]
+    fn selection_shown_with_color() {
+        let binary_input = [0x0A, 0x04, 'a' as u8, 'b' as u8, 'c' as u8, 'd' as u8];
+        let proto = ProtoData::new("message M { string f1=1; }").unwrap().finalize().unwrap();
+        let mut limit = binary_input.len() as u32;
+        let root_msg = proto.auto_detect_root_message().unwrap();
+        let mut read = PbReader::new(binary_input.as_slice());
+        let data = MessageData::new(&mut read, &proto, root_msg, &mut limit).unwrap();
+        let mut app = App::for_tests(data, proto, FieldOrder::Proto, 15, 25).unwrap();
+
+        app.run_command(ScrollHorizontally(1)).unwrap(); // start edit
+        app.run_command(ScrollHorizontally(1)).unwrap(); // move after 'a'
+        app.run_command(SelectHorizontally(2)).unwrap(); // select "bc"
+        app.to_strings();
+
+        // the selected chars (and only they) are drawn with the selection style
+        // (cursor Some(_) renders the layout as the focused one)
+        let item = &app.layouts.items[0];
+        let indent = app.layouts.indents[item.level() - 1];
+        let lines = item.get_screen(&app.data, app.layouts.width, indent, &app.layout_config, Some((0, 0)));
+        let styled = |wanted: TextStyle| -> String {
+            lines.0.iter().flat_map(|line| line.0.iter())
+                .filter(|(_, style)| *style == wanted)
+                .map(|(c, _)| *c).collect()
+        };
+        assert_eq!(styled(TextStyle::SelectedValue), "bc");
+        assert_eq!(styled(TextStyle::Value), "ad");
+    }
+
+    #[test]
+    fn multi_cursor_in_string_editor() {
+        let binary_input = [0x0A, 0x07, 'a' as u8, 'b' as u8, 'c' as u8, '\n' as u8, 'd' as u8, 'e' as u8, 'f' as u8];
+        let proto = ProtoData::new("message M { string f1=1; }").unwrap().finalize().unwrap();
+        let mut limit = binary_input.len() as u32;
+        let root_msg = proto.auto_detect_root_message().unwrap();
+        let mut read = PbReader::new(binary_input.as_slice());
+        let data = MessageData::new(&mut read, &proto, root_msg, &mut limit).unwrap();
+        let mut app = App::for_tests(data, proto, FieldOrder::Proto, 25, 25).unwrap();
+
+        let styled_chars = |app: &App, wanted: TextStyle| -> String {
+            let item = &app.layouts.items[0];
+            let indent = app.layouts.indents[item.level() - 1];
+            // cursor Some(_) renders the layout as the focused one
+            let lines = item.get_screen(&app.data, app.layouts.width, indent, &app.layout_config, Some((0, 0)));
+            lines.0.iter().flat_map(|line| line.0.iter())
+                .filter(|(_, style)| *style == wanted)
+                .map(|(c, _)| *c).collect()
+        };
+
+        app.run_command(ScrollHorizontally(1)).unwrap(); // start edit
+        assert_eq!(app.to_strings(), [" f1: abc                 ", "  2: def                 ", "cursor: 5,1"]);
+
+        // Alt+Shift+Down adds a cursor on the next line, it becomes the active one
+        app.run_command(AddCursor(1)).unwrap();
+        assert_eq!(app.to_strings(), [" f1: abc                 ", "  2: def                 ", "cursor: 5,2"]);
+        // the non-active cursor is drawn as a static styled cell
+        assert_eq!(styled_chars(&app, TextStyle::EditCursor), "a");
+
+        // typing inserts at both cursors
+        app.run_command(KeyPress('x')).unwrap();
+        assert_eq!(app.to_strings(), [" f1: xabc                ", "  2: xdef                ", "cursor: 6,2"]);
+
+        // first Esc drops the additional cursors, the editor stays open
+        app.run_command(UserCommand::Exit).unwrap();
+        assert_eq!(app.to_strings(), [" f1: xabc                ", "  2: xdef                ", "cursor: 6,2"]);
+        assert_eq!(styled_chars(&app, TextStyle::EditCursor), "");
+        app.run_command(KeyPress('y')).unwrap();
+        assert_eq!(app.to_strings(), [" f1: xabc                ", "  2: xydef               ", "cursor: 7,2"]);
+
+        // second Esc closes the editor and applies the change
+        app.run_command(UserCommand::Exit).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [" f1: xabc         string ", "  2: xydef               "]);
+    }
+
+    #[test]
+    fn undo_redo_in_string_editor() {
+        let binary_input = [0x0A, 0x03, 'a' as u8, 'b' as u8, 'c' as u8];
+        let proto = ProtoData::new("message M { string f1=1; }").unwrap().finalize().unwrap();
+        let mut limit = binary_input.len() as u32;
+        let root_msg = proto.auto_detect_root_message().unwrap();
+        let mut read = PbReader::new(binary_input.as_slice());
+        let data = MessageData::new(&mut read, &proto, root_msg, &mut limit).unwrap();
+        let mut app = App::for_tests(data, proto, FieldOrder::Proto, 25, 25).unwrap();
+
+        app.run_command(ScrollHorizontally(1)).unwrap(); // start edit
+        app.run_command(KeyPress('x')).unwrap();
+        assert_eq!(app.to_strings(), [" f1: xabc                ", "cursor: 6,1"]);
+
+        // Ctrl+Z reverts the typed char and moves the cursor back
+        app.run_command(UserCommand::Undo).unwrap();
+        assert_eq!(app.to_strings(), [" f1: abc                 ", "cursor: 5,1"]);
+
+        // Ctrl+Y returns it
+        app.run_command(UserCommand::Redo).unwrap();
+        assert_eq!(app.to_strings(), [" f1: xabc                ", "cursor: 6,1"]);
+
+        // Enter is also undoable, the cursor line follows
+        app.run_command(CollapsedToggle).unwrap();
+        assert_eq!(app.to_strings(), [" f1: x                   ", "  2: abc                 ", "cursor: 5,2"]);
+        app.run_command(UserCommand::Undo).unwrap();
+        assert_eq!(app.to_strings(), [" f1: xabc                ", "cursor: 6,1"]);
+    }
+
+    #[test]
+    fn two_string_editors_feel_like_one() {
+        let binary_input = [
+            0x0A, 0x07, 'a' as u8, 'b' as u8, 'c' as u8, '\n' as u8, 'd' as u8, 'e' as u8, 'f' as u8,
+            0x12, 0x03, 'g' as u8, 'h' as u8, 'i' as u8];
+        let proto = ProtoData::new("message M { string f1=1; string f2=2; }").unwrap().finalize().unwrap();
+        let mut limit = binary_input.len() as u32;
+        let root_msg = proto.auto_detect_root_message().unwrap();
+        let mut read = PbReader::new(binary_input.as_slice());
+        let data = MessageData::new(&mut read, &proto, root_msg, &mut limit).unwrap();
+        let mut app = App::for_tests(data, proto, FieldOrder::Proto, 25, 25).unwrap();
+
+        // styles of a layout rendered as the focused one: shows what cursor and
+        // selection information the layout still stores
+        let styled_chars = |app: &App, item_index: usize, wanted: TextStyle| -> String {
+            let item = &app.layouts.items[item_index];
+            let indent = app.layouts.indents[item.level() - 1];
+            let lines = item.get_screen(&app.data, app.layouts.width, indent, &app.layout_config, Some((0, 0)));
+            lines.0.iter().flat_map(|line| line.0.iter())
+                .filter(|(_, style)| *style == wanted)
+                .map(|(c, _)| *c).collect()
+        };
+
+        app.run_command(ScrollHorizontally(1)).unwrap(); // open the editor of f1
+        assert_eq!(app.to_strings(), [
+            " f1: abc                 ",
+            "  2: def                 ",
+            " f2: 'ghi'        string ",
+            "cursor: 5,1"]);
+
+        // moving down out of f1 leaves its editor open, but it goes to inactive
+        // mode: shown like a regular field, and the blinking cursor is gone
+        // (f2 has no editor yet)
+        app.run_command(ScrollVertically(1)).unwrap();
+        app.run_command(ScrollVertically(1)).unwrap();
+        assert_eq!(app.to_strings(), [
+            " f1: abc          string ",
+            "  2: def                 ",
+            " f2: 'ghi'        string "]);
+
+        app.run_command(ScrollHorizontally(1)).unwrap(); // open the editor of f2
+        assert_eq!(app.to_strings(), [
+            " f1: abc          string ",
+            "  2: def                 ",
+            " f2: ghi                 ",
+            "cursor: 5,3"]);
+
+        // moving up from f2 enters the LAST line of the f1 editor, same column;
+        // now f2 is the inactive one and shows its quotes and type back
+        app.run_command(ScrollVertically(-1)).unwrap();
+        assert_eq!(app.to_strings(), [
+            " f1: abc                 ",
+            "  2: def                 ",
+            " f2: 'ghi'        string ",
+            "cursor: 5,2"]);
+
+        // moving down from column 2 of f1 enters f2 at column 2: one text for the user
+        app.run_command(ScrollHorizontally(2)).unwrap();
+        app.run_command(ScrollVertically(1)).unwrap();
+        assert_eq!(app.to_strings(), [
+            " f1: abc          string ",
+            "  2: def                 ",
+            " f2: ghi                 ",
+            "cursor: 7,3"]);
+
+        // a selection disappears when the editor loses focus, nothing is stored
+        app.run_command(SelectHorizontally(1)).unwrap();
+        assert_eq!(styled_chars(&app, 1, TextStyle::SelectedValue), "i");
+        app.run_command(ScrollVertically(-1)).unwrap();
+        assert_eq!(styled_chars(&app, 1, TextStyle::SelectedValue), "");
+    }
+
+    #[test]
+    fn type_in_two_editors_of_repeated_field() {
+        // two strings of the same repeated field
+        let binary_input = [
+            0x0A, 0x03, 'a' as u8, 'b' as u8, 'c' as u8,
+            0x0A, 0x03, 'd' as u8, 'e' as u8, 'f' as u8];
+        let proto = ProtoData::new("message M { repeated string f1=1; }").unwrap().finalize().unwrap();
+        let mut limit = binary_input.len() as u32;
+        let root_msg = proto.auto_detect_root_message().unwrap();
+        let mut read = PbReader::new(binary_input.as_slice());
+        let data = MessageData::new(&mut read, &proto, root_msg, &mut limit).unwrap();
+        let mut app = App::for_tests(data, proto, FieldOrder::Proto, 25, 25).unwrap();
+
+        assert_eq!(app.to_strings(), [
+            " f1: 'abc'       string* ",
+            " f1: 'def'       string* "]);
+
+        // activate the first editor and type
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        app.run_command(KeyPress('x')).unwrap();
+        assert_eq!(app.to_strings(), [
+            " f1: xabc                ",
+            " f1: 'def'       string* ",
+            "cursor: 6,1"]);
+
+        // arrow down: the first editor loses focus and commits its text; it
+        // remains open, but is shown in inactive mode (quotes and type name)
+        app.run_command(ScrollVertically(1)).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [
+            " f1: 'xabc'      string* ",
+            " f1: 'def'       string* "]);
+
+        // activate the second editor and type
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        app.run_command(KeyPress('y')).unwrap();
+        assert_eq!(app.to_strings(), [
+            " f1: 'xabc'      string* ",
+            " f1: ydef                ",
+            "cursor: 6,2"]);
+
+        // Esc closes the second editor; the first one committed on focus loss
+        app.run_command(UserCommand::Exit).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [
+            " f1: 'xabc'      string* ",
+            " f1: 'ydef'      string* "]);
+
+        // the typed data of BOTH editors is in the message data
+        match &app.data.get_field(&[(1, 0).into()]).unwrap().value {
+            SCALAR(STR(value)) => assert_eq!(value, "xabc"),
+            _ => panic!("f1[0] is not a string"),
+        }
+        match &app.data.get_field(&[(1, 1).into()]).unwrap().value {
+            SCALAR(STR(value)) => assert_eq!(value, "ydef"),
+            _ => panic!("f1[1] is not a string"),
+        }
     }
 
     #[test]

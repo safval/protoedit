@@ -673,6 +673,77 @@ impl TextEditor {
     // TODO    pub fn on_move_next_word(&mut self) { todo!(); }
     // TODO    pub fn on_move_prev_word(&mut self) { todo!(); }
 
+    // multi-cursor: add a cursor one line above (dy < 0) or below (dy > 0) the active
+    // one, keeping the preferred column; the new cursor becomes the active one
+    pub fn add_cursor(&mut self, cfg: &TextConfig, dy: isize) {
+        let Some(active) = self.selected.get(self.active_cursor_index) else { debug_assert!(false); return };
+        let (_, y) = self.view.lines.to2d(cfg, active.pos);
+        let new_y = y as isize + dy;
+        if new_y < 0 || new_y >= self.view.lines.height(cfg) as isize { return; }
+
+        let x_pref = active.x_pref;
+        let new_pos = self.view.lines.to1d(cfg, (x_pref, new_y as usize));
+
+        // the target position may already hold a cursor: don't duplicate it
+        // (typing would insert the char twice), just make it the active one
+        if let Some(index) = self.selected.iter().position(|sel| sel.pos == new_pos) {
+            self.active_cursor_index = index;
+            return;
+        }
+
+        self.selected.push(TextSelection { pos: new_pos, len: 0, x_pref });
+        self.selected.sort_unstable();
+        self.active_cursor_index = self.selected.iter().position(|sel| sel.pos == new_pos).unwrap();
+    }
+
+    // leave only the active cursor, used when multi-cursor mode is stopped (Esc)
+    pub fn collapse_cursors(&mut self) {
+        if self.selected.len() > 1 {
+            debug_assert!(self.active_cursor_index < self.selected.len());
+            let active = self.selected.remove(self.active_cursor_index.min(self.selected.len() - 1));
+            self.selected.clear();
+            self.selected.push(active);
+            self.active_cursor_index = 0;
+        }
+    }
+
+    // forget all cursors and selections, called when the editor loses focus:
+    // an inactive editor keeps only its text (and undo history), the cursor
+    // position will be given anew when the focus returns
+    pub fn clear_cursors(&mut self) {
+        self.selected = vec![TextSelection::default()];
+        self.active_cursor_index = 0;
+    }
+
+    // place the single cursor at the given screen column and line; the column is
+    // kept as the preferred one, so it survives moving over shorter lines
+    pub fn set_cursor_at(&mut self, cfg: &TextConfig, x: usize, y: usize) {
+        let pos = self.view.lines.to1d(cfg, (x, y));
+        self.selected = vec![TextSelection { pos, len: 0, x_pref: x }];
+        self.active_cursor_index = 0;
+    }
+
+    // whether a cursor other than the active one stands at this byte position;
+    // the active cursor is not counted — it is shown by the blinking terminal cursor
+    pub fn is_other_cursor(&self, pos: usize) -> bool {
+        self.selected.iter().enumerate()
+            .any(|(index, sel)| index != self.active_cursor_index && sel.pos == pos)
+    }
+
+    // whether the char at this byte position is inside any selection
+    pub fn is_selected(&self, pos: usize) -> bool {
+        self.selected.iter().any(|sel| {
+            let (start, finish) = sel.selected_range();
+            pos >= start && pos < finish
+        })
+    }
+
+    // screen line the active cursor stands on
+    pub fn cursor_line(&self, cfg: &TextConfig) -> usize {
+        self.selected.get(self.active_cursor_index)
+            .map_or(0, |sel| self.view.lines.to2d(cfg, sel.pos).1)
+    }
+
     pub fn on_move_x(&mut self, cfg: &TextConfig, delta: isize, select: bool) {
         for sel in &mut self.selected {
             sel.move_x(cfg, &self.view.lines, delta, select);
@@ -714,6 +785,7 @@ impl TextEditor {
         }
 
         self.history.0.push(changes);
+        self.history.1.clear(); // a new change makes the redo history invalid
         self.view.lines.starts.replace(vec![]);
 
         // x_pref must be calculated on the updated text: after inserting '\n'
@@ -723,23 +795,97 @@ impl TextEditor {
         }
     }
 
+    // replace all cursors with one cursor per just undone/redone change
+    fn set_cursors(&mut self, cfg: &TextConfig, positions: Vec<usize>) {
+        debug_assert!(!positions.is_empty());
+        self.selected = positions.into_iter().map(|pos| TextSelection { pos, len: 0, x_pref: 0 }).collect();
+        self.active_cursor_index = self.active_cursor_index.min(self.selected.len() - 1);
+        self.view.lines.starts.replace(vec![]);
+        for sel in &mut self.selected {
+            sel.x_pref = self.view.lines.to2d(cfg, sel.pos).0;
+        }
+    }
+
+    pub fn undo(&mut self, cfg: &TextConfig) {
+        let Some(set) = self.history.0.pop() else { return; };
+
+        // revert in reverse order of applying: every `at` is a coordinate in the
+        // text as it was before this change set, valid again once the changes
+        // located after it in the text (before it in the vec) are reverted
+        for change in set.changes.iter().rev() {
+            self.view.lines.text.replace_range(change.at..change.at + change.after.len(), &change.before);
+        }
+
+        // one cursor at the end of each restored fragment
+        let positions = set.changes.iter().map(|change| change.at + change.before.len()).collect();
+        self.set_cursors(cfg, positions);
+        self.history.1.push(set);
+    }
+
+    pub fn redo(&mut self, cfg: &TextConfig) {
+        let Some(set) = self.history.1.pop() else { return; };
+
+        for change in &set.changes {
+            change.apply(&mut self.view.lines.text);
+        }
+
+        // one cursor after each inserted fragment; the changes later in the vec are
+        // located earlier in the text, their size difference shifts this cursor
+        let mut shift = 0isize;
+        let mut positions: Vec<usize> = set.changes.iter().rev().map(|change| {
+            let pos = (change.at as isize + shift) as usize + change.after.len();
+            shift += change.after.len() as isize - change.before.len() as isize;
+            pos
+        }).collect();
+        positions.reverse();
+        self.set_cursors(cfg, positions);
+        self.history.0.push(set);
+    }
+
     pub fn on_delete(&mut self, cfg: &TextConfig, backspace: bool) {
         let mut changes = TextChangeSet::new(TextChangeType::Delete);
 
+        // all changes are computed against the same (unmodified) text, one entry
+        // per cursor even when nothing was deleted (needed for the shift below)
+        let mut removed = Vec::with_capacity(self.selected.len());
         for sel in &mut self.selected {
             if let Some(change) = sel.on_delete(&self.view.lines.text, backspace) {
+                removed.push(change.before.len());
                 changes.changes.push(change);
-                sel.x_pref = self.view.lines.to2d(cfg, sel.pos).0;
+            } else {
+                removed.push(0);
             }
         }
 
         if !changes.changes.is_empty() {
-            //            for change in changes.changes.iter().rev() {
             for change in &changes.changes {
                 change.apply(&mut self.view.lines.text);
             }
+
+            // shift cursors left by the bytes deleted before them: the cursors are
+            // sorted in reverse order, so the deletions of the following elements
+            // are located earlier in the text
+            let mut s = 0usize;
+            removed = removed
+                .into_iter()
+                .rev()
+                .map(|x| {
+                    let old = s;
+                    s += x;
+                    old
+                })
+                .collect();
+            removed.reverse();
+            for i in 0..self.selected.len() {
+                self.selected[i].pos -= removed[i];
+            }
+
             self.history.0.push(changes);
+            self.history.1.clear(); // a new change makes the redo history invalid
             self.view.lines.starts.replace(vec![]);
+            for sel in &mut self.selected {
+                sel.x_pref = self.view.lines.to2d(cfg, sel.pos).0;
+            }
         }
     }
 }
@@ -910,6 +1056,71 @@ fn delete_selection() {
 }
 
 #[test]
+fn selection_ranges() {
+    let mut edit = TextEditor::new(String::from("1234567890"), 80, 24);
+    let cfg = TextConfig::default();
+    edit.on_move_x(&cfg, 2, false);
+    edit.on_move_x(&cfg, 3, true); // select "345"
+    let shown: String = (0..10).map(|pos| if edit.is_selected(pos) { 'x' } else { '.' }).collect();
+    assert_eq!(shown, "..xxx.....");
+
+    // move the cursor back over the anchor: "2" selected backward
+    edit.on_move_x(&cfg, -4, true);
+    let shown: String = (0..10).map(|pos| if edit.is_selected(pos) { 'x' } else { '.' }).collect();
+    assert_eq!(shown, ".x........");
+
+    // moving without selection drops it
+    edit.on_move_x(&cfg, 1, false);
+    let shown: String = (0..10).map(|pos| if edit.is_selected(pos) { 'x' } else { '.' }).collect();
+    assert_eq!(shown, "..........");
+}
+
+#[test]
+fn delete_selection_y() {
+    let mut edit = TextEditor::new(String::from("123\n456\n789"), 80, 24);
+    let cfg = TextConfig::default();
+    edit.on_move_x(&cfg, 1, false);
+    edit.on_move_y(&cfg, 1, true); // select "23\n4"
+    assert_eq!(edit.cursor_line(&cfg), 1);
+    edit.on_delete(&cfg, false);
+    assert_eq!(edit.view.lines.text, "156\n789");
+    assert_eq!(edit.cursor_line(&cfg), 0);
+}
+
+#[test]
+fn select_to_line_end_and_type() {
+    let mut edit = TextEditor::new(String::from("123\n456\n789"), 80, 24);
+    let cfg = TextConfig::default();
+    edit.on_move_y(&cfg, 1, false);
+    edit.on_move_x(&cfg, 1, false);
+    edit.on_move_x(&cfg, isize::MAX, true); // Shift+End: select "56", not beyond the line
+    edit.on_char(&cfg, 'x');
+    assert_eq!(edit.view.lines.text, "123\n4x\n789");
+}
+
+#[test]
+fn select_to_line_start_and_delete() {
+    let mut edit = TextEditor::new(String::from("123\n456\n789"), 80, 24);
+    let cfg = TextConfig::default();
+    edit.on_move_y(&cfg, 1, false);
+    edit.on_move_x(&cfg, 2, false);
+    edit.on_move_x(&cfg, isize::MIN, true); // Shift+Home: select "45" backward
+    edit.on_delete(&cfg, false);
+    assert_eq!(edit.view.lines.text, "123\n6\n789");
+}
+
+#[test]
+fn backspace_deletes_selection() {
+    let mut edit = TextEditor::new(String::from("1234567890"), 80, 24);
+    let cfg = TextConfig::default();
+    edit.on_move_x(&cfg, 2, false);
+    edit.on_move_x(&cfg, 3, true);
+    // with an active selection Backspace removes the selection, same as Del
+    edit.on_delete(&cfg, true);
+    assert_eq!(edit.view.lines.text, "1267890");
+}
+
+#[test]
 fn delete_multi_cursor() {
     let mut edit = TextEditor::new(String::from("1234567890"), 80, 24);
     let cfg = TextConfig::default();
@@ -951,6 +1162,167 @@ fn delete_multi_selection() {
     ];
     edit.on_delete(&cfg, false);
     assert_eq!(edit.view.lines.text, "145670");
+}
+
+#[test]
+fn clear_cursors_and_set_cursor() {
+    let mut edit = TextEditor::new(String::from("123\n456"), 80, 24);
+    let cfg = TextConfig::default();
+    edit.on_move_x(&cfg, 2, false);
+    edit.on_move_x(&cfg, 1, true);
+    edit.add_cursor(&cfg, 1);
+    assert!(edit.selected.len() > 1);
+
+    // losing focus forgets cursors and selections, only the text remains
+    edit.clear_cursors();
+    assert_eq!(edit.selected, vec![TextSelection::default()]);
+
+    // regaining focus places the cursor at the given column and line
+    edit.set_cursor_at(&cfg, 2, 1);
+    edit.on_char(&cfg, 'x');
+    assert_eq!(edit.view.lines.text, "123\n45x6");
+}
+
+#[test]
+fn delete_multi_cursor_shifts_cursors() {
+    let mut edit = TextEditor::new(String::from("1234567890"), 80, 24);
+    let cfg = TextConfig::default();
+    edit.add_selection(&cfg, 5, 0);
+    edit.on_delete(&cfg, false); // delete '1' and '6'
+    assert_eq!(edit.view.lines.text, "23457890");
+    // both cursors stand exactly where the deleted chars were
+    edit.on_char(&cfg, 'x');
+    assert_eq!(edit.view.lines.text, "x2345x7890");
+}
+
+#[test]
+fn backspace_multi_cursor_shifts_cursors() {
+    let mut edit = TextEditor::new(String::from("123\n456\n789"), 80, 24);
+    let cfg = TextConfig::default();
+    edit.on_move_x(&cfg, 1, false);
+    edit.add_cursor(&cfg, 1);
+    edit.add_cursor(&cfg, 1);
+    edit.on_char(&cfg, 'x');
+    assert_eq!(edit.view.lines.text, "1x23\n4x56\n7x89");
+    edit.on_delete(&cfg, true);
+    assert_eq!(edit.view.lines.text, "123\n456\n789");
+    // the cursors are back at their positions before typing
+    edit.on_char(&cfg, 'y');
+    assert_eq!(edit.view.lines.text, "1y23\n4y56\n7y89");
+}
+
+#[test]
+fn undo_redo_typing() {
+    let mut edit = TextEditor::new(String::from("abc"), 80, 24);
+    let cfg = TextConfig::default();
+    edit.on_char(&cfg, 'x');
+    edit.on_char(&cfg, 'y');
+    assert_eq!(edit.view.lines.text, "xyabc");
+    edit.undo(&cfg);
+    assert_eq!(edit.view.lines.text, "xabc");
+    edit.undo(&cfg);
+    assert_eq!(edit.view.lines.text, "abc");
+    edit.undo(&cfg); // empty history is not an error
+    assert_eq!(edit.view.lines.text, "abc");
+    edit.redo(&cfg);
+    edit.redo(&cfg);
+    assert_eq!(edit.view.lines.text, "xyabc");
+    edit.redo(&cfg); // empty redo history is not an error
+    // the cursor is restored after the last redone char
+    edit.on_char(&cfg, 'z');
+    assert_eq!(edit.view.lines.text, "xyzabc");
+}
+
+#[test]
+fn undo_delete_restores_text() {
+    let mut edit = TextEditor::new(String::from("1234567890"), 80, 24);
+    let cfg = TextConfig::default();
+    edit.on_move_x(&cfg, 2, false);
+    edit.on_move_x(&cfg, 3, true);
+    edit.on_delete(&cfg, false); // delete selected "345"
+    assert_eq!(edit.view.lines.text, "1267890");
+    edit.undo(&cfg);
+    assert_eq!(edit.view.lines.text, "1234567890");
+    // the cursor stands after the restored fragment
+    edit.on_char(&cfg, 'x');
+    assert_eq!(edit.view.lines.text, "12345x67890");
+    // the new change dropped the redo history
+    edit.redo(&cfg);
+    assert_eq!(edit.view.lines.text, "12345x67890");
+}
+
+#[test]
+fn undo_redo_multi_cursor_typing() {
+    let mut edit = TextEditor::new(String::from("123\n456\n789"), 80, 24);
+    let cfg = TextConfig::default();
+    edit.add_cursor(&cfg, 1);
+    edit.add_cursor(&cfg, 1);
+    edit.on_char(&cfg, 'x');
+    assert_eq!(edit.view.lines.text, "x123\nx456\nx789");
+    edit.undo(&cfg);
+    assert_eq!(edit.view.lines.text, "123\n456\n789");
+    edit.redo(&cfg);
+    assert_eq!(edit.view.lines.text, "x123\nx456\nx789");
+    // all three cursors are restored by undo/redo
+    edit.on_char(&cfg, 'y');
+    assert_eq!(edit.view.lines.text, "xy123\nxy456\nxy789");
+}
+
+#[test]
+fn undo_multi_cursor_delete() {
+    let mut edit = TextEditor::new(String::from("1234567890"), 80, 24);
+    let cfg = TextConfig::default();
+    edit.add_selection(&cfg, 5, 0);
+    edit.on_delete(&cfg, false);
+    assert_eq!(edit.view.lines.text, "23457890");
+    edit.undo(&cfg);
+    assert_eq!(edit.view.lines.text, "1234567890");
+    edit.redo(&cfg);
+    assert_eq!(edit.view.lines.text, "23457890");
+}
+
+#[test]
+fn add_cursor_below_and_type() {
+    let mut edit = TextEditor::new(String::from("123\n456\n789"), 80, 24);
+    let cfg = TextConfig::default();
+    edit.on_move_x(&cfg, 1, false);
+    edit.add_cursor(&cfg, 1); // cursors keep the column of the active one
+    edit.add_cursor(&cfg, 1);
+    assert_eq!(edit.selected.len(), 3);
+    edit.on_char(&cfg, 'x');
+    assert_eq!(edit.view.lines.text, "1x23\n4x56\n7x89");
+    edit.on_delete(&cfg, true);
+    assert_eq!(edit.view.lines.text, "123\n456\n789");
+}
+
+#[test]
+fn add_cursor_edges_and_duplicates() {
+    let mut edit = TextEditor::new(String::from("12\n34"), 80, 24);
+    let cfg = TextConfig::default();
+    edit.add_cursor(&cfg, -1); // no line above the first one
+    assert_eq!(edit.selected.len(), 1);
+    edit.add_cursor(&cfg, 1);
+    assert_eq!(edit.selected.len(), 2);
+    edit.add_cursor(&cfg, 1); // no line below the last one
+    assert_eq!(edit.selected.len(), 2);
+    edit.add_cursor(&cfg, -1); // the position already has a cursor, no duplicate
+    assert_eq!(edit.selected.len(), 2);
+    edit.on_char(&cfg, 'x'); // each cursor types exactly once
+    assert_eq!(edit.view.lines.text, "x12\nx34");
+}
+
+#[test]
+fn collapse_cursors_keeps_active() {
+    let mut edit = TextEditor::new(String::from("123\n456\n789"), 80, 24);
+    let cfg = TextConfig::default();
+    edit.add_cursor(&cfg, 1);
+    edit.add_cursor(&cfg, 1);
+    assert_eq!(edit.selected.len(), 3);
+    edit.collapse_cursors();
+    assert_eq!(edit.selected.len(), 1);
+    // the active cursor (the last added, on the third line) is the one that remains
+    edit.on_char(&cfg, 'x');
+    assert_eq!(edit.view.lines.text, "123\n456\nx789");
 }
 
 #[test]

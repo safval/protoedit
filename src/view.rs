@@ -11,7 +11,7 @@ use crossterm::style::Color;
 use crate::proto::{FieldProtoPtr, ProtoData};
 use crate::Selection;
 use crate::trz::{Change, ChangeType};
-use crate::wire::{FieldPath, FieldValue, MessageData, ScalarValue};
+use crate::wire::{FieldPath, FieldPos, FieldValue, MessageData, ScalarValue};
 use crate::wire::ScalarValue::{BYTES, STR};
 use crate::text_edit::*;
 
@@ -28,6 +28,19 @@ pub enum UserCommand
     // move up - negative value, move down - positive
     ScrollVertically(isize),
     ScrollSibling(i8),
+    // hotkeys: Shift+←/→, Shift+↑/↓ and Shift+Home/End
+    // move the cursor of an in-place editor expanding the selection
+    SelectHorizontally(i8),
+    SelectVertically(isize),
+    SelectHome,
+    SelectEnd,
+    // hotkeys: Alt+Shift+↑/↓
+    // multi-cursor: add a cursor one line above/below the active one
+    AddCursor(i8),
+    // hotkeys: Ctrl+Z and Ctrl+Y (or Ctrl+Shift+Z)
+    // for now only inside an in-place editor; app-level undo (trz.rs) is a future task
+    Undo,
+    Redo,
     ScrollToBottom,
     Home,
     End,
@@ -73,6 +86,14 @@ pub enum UserCommand
     SortDataView,
     // not a command, just key pressed
     KeyPress(char),
+    // internal commands, sent by Layouts (not bound to keys) when the cursor
+    // moves from one layout to another: the old layout drops its editor cursors
+    // and selection, the new one — if an editor is open in both — continues at
+    // the given preferred column, so neighboring editors feel like one text.
+    // The bool of FocusGained is true when the cursor enters from the layout
+    // below (moving up), so the editor cursor goes to its last line
+    FocusLost,
+    FocusGained(u16, bool),
 }
 
 pub enum CommandResult {
@@ -102,7 +123,14 @@ pub struct Layouts { // rename Document
 }
 
 pub struct LayoutParams {
-    // how many lines requires this layout on the screen
+    // how many lines requires this layout on the screen.
+    // NOTE: while an in-place editor is open this value is stale — calc_sizes runs
+    // only after a CommandResult::ChangeData is applied (App::after_command sets
+    // need_update_layout_height), and an open editor changes only its own state.
+    // So after Enter adds a line in a string editor, get_screen already draws the
+    // extra line, but Layouts::run_command(ScrollVertically) still uses the old
+    // height for layout boundaries and can move the cursor out of the field
+    // before the edit is committed with Esc.
     pub height: usize,
     pub path: FieldPath,
     // how many repeated data with the same id shown by this layout, starting from path
@@ -131,6 +159,9 @@ pub trait ViewLayout {
     fn get_screen(&self, root: &MessageData, path: &FieldPath, amount: usize, width: u16, indent: u16, config: &LayoutConfig, cursor: Option<(u16, usize)>) -> ScreenLines;
     // the blinking cursor of the terminal will be shown in this position, position in this layout, not screen
     fn get_text_edit_cursor(&self) -> Option<(u16, usize)> { None }
+    // preferred cursor column of an open in-place editor; used to keep the column
+    // when the focus moves vertically between editors of neighboring fields
+    fn get_preferred_column(&self) -> Option<u16> { None }
     fn on_command(&mut self, root: &MessageData, path: &FieldPath, amount: usize, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult;
     // get ids of children fields already shown in this layout
     fn get_consumed_fields(&self, root: &MessageData, path: &FieldPath, config: &LayoutConfig) -> HashSet<i32> { HashSet::new() }
@@ -267,6 +298,7 @@ pub enum TextStyle {
     SelectedFieldIndex,
     Value, // data content
     SelectedValue,
+    EditCursor, // a non-active cursor of a multi-cursor editor (the active one blinks)
     DefaultValue,
     DataSize, // size of collapsed field
     Typename, // name of scalar type
@@ -732,7 +764,13 @@ impl ViewLayout for StringLayout {
         let mut lines = vec![];
         let mut line = ScreenLine::new(width);
 
-        if let Some(edit) = &self.edit {
+        // only the focused editor is drawn in editing style (`cursor` is Some just
+        // for the selected layout); an unfocused editor goes to inactive mode and
+        // is drawn like a regular field: quotes around a short text and the type
+        // name at the end of the line
+        let focused_edit = if cursor.is_some() { self.edit.as_ref() } else { None };
+
+        if let Some(edit) = focused_edit {
             let mut line_number = 1;
             let mut line_number_changed = false;
             for indexes in edit.view.lines.starts_and_ends(&config.text_edit_cfg) {
@@ -749,7 +787,20 @@ impl ViewLayout for StringLayout {
                 }
 
                 line.0.push((' ', TextStyle::Divider));
-                line.add_string(edit.view.lines.text[indexes.0..indexes.1].to_string(), TextStyle::Value);
+                for (offset, c) in edit.view.lines.text[indexes.0..indexes.1].char_indices() {
+                    let pos = indexes.0 + offset;
+                    let style = if edit.is_other_cursor(pos) { TextStyle::EditCursor }
+                        else if edit.is_selected(pos) { TextStyle::SelectedValue }
+                        else { TextStyle::Value };
+                    line.0.push((c, style));
+                }
+                // a non-active cursor standing at the line end (on the '\n' or at the
+                // text end) has no char under it, show it on the padding space;
+                // for a wrapped line (indexes.2) that position is the start of the
+                // next line and will be shown there
+                if !indexes.2 && edit.is_other_cursor(indexes.1) {
+                    line.0.push((' ', TextStyle::EditCursor));
+                }
 
                 line.fix_length(width);
                 lines.push(line);
@@ -761,33 +812,42 @@ impl ViewLayout for StringLayout {
             if let Some(field_def) = root.get_field_definition(path) {
                 line.add_field_name(field_def.name().clone(), indent, &cursor);
 
-                if let Some(field) = root.get_field(&path.0) {
-                    if let FieldValue::SCALAR(ScalarValue::STR(value)) = &field.value {
-                        let line_by_line = self.get_lines_formated(width, indent, field_def.repeated(), amount == 0, value);
-                        if line_by_line.len() <= 1 {
-                            line.0.push((' ', TextStyle::Divider));
-                            line.0.push(('\'', TextStyle::Divider));
-                            line.add_string(value.to_string(), TextStyle::Value);
-                            line.0.push(('\'', TextStyle::Divider));
-                            line.fix_length(width);
-                        } else { // multiline
-                            let mut index = 0;
-                            for text in line_by_line {
-                                if index > 0 {
-                                    lines.push(line);
-                                    line = ScreenLine::new(width);
-                                    line.add_value_address(
-                                        if text.1 {
-                                            format!("{}", index + 1) // line after CR/LF
-                                        } else {
-                                            String::new() // line limited by length
-                                        }, indent, &cursor, lines.len());
-                                }
-                                line.0.push((' ', TextStyle::Divider));
-                                line.add_string(text.0.to_string(), TextStyle::Value);
-                                line.fix_length(width);
-                                if text.1 { index += 1 }
+                // an open but unfocused editor shows its own text: it is committed
+                // on focus loss, so normally it equals the field value in the data
+                let mut value: Option<&String> = self.edit.as_ref().map(|edit| &edit.view.lines.text);
+                if value.is_none() {
+                    if let Some(field) = root.get_field(&path.0) {
+                        if let FieldValue::SCALAR(ScalarValue::STR(data)) = &field.value {
+                            value = Some(data);
+                        }
+                    }
+                }
+
+                if let Some(value) = value {
+                    let line_by_line = self.get_lines_formated(width, indent, field_def.repeated(), amount == 0, value);
+                    if line_by_line.len() <= 1 {
+                        line.0.push((' ', TextStyle::Divider));
+                        line.0.push(('\'', TextStyle::Divider));
+                        line.add_string(value.to_string(), TextStyle::Value);
+                        line.0.push(('\'', TextStyle::Divider));
+                        line.fix_length(width);
+                    } else { // multiline
+                        let mut index = 0;
+                        for text in line_by_line {
+                            if index > 0 {
+                                lines.push(line);
+                                line = ScreenLine::new(width);
+                                line.add_value_address(
+                                    if text.1 {
+                                        format!("{}", index + 1) // line after CR/LF
+                                    } else {
+                                        String::new() // line limited by length
+                                    }, indent, &cursor, lines.len());
                             }
+                            line.0.push((' ', TextStyle::Divider));
+                            line.add_string(text.0.to_string(), TextStyle::Value);
+                            line.fix_length(width);
+                            if text.1 { index += 1 }
                         }
                     }
                 } else {
@@ -812,6 +872,11 @@ impl ViewLayout for StringLayout {
             }
         }
         return None;
+    }
+    fn get_preferred_column(&self) -> Option<u16> {
+        self.edit.as_ref()
+            .and_then(|edit| edit.selected.get(edit.active_cursor_index))
+            .map(|sel| sel.x_pref as u16)
     }
     fn on_command(&mut self, root: &MessageData, path: &FieldPath, amount: usize, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult
     {
@@ -848,9 +913,86 @@ impl ViewLayout for StringLayout {
                 CommandResult::Redraw
             }
 
+            UserCommand::SelectHorizontally(delta) => {
+                if let Some(edit) = &mut self.edit {
+                    edit.on_move_x(&config.text_edit_cfg, delta as isize, true);
+                    CommandResult::Redraw
+                } else { CommandResult::None }
+            }
+            UserCommand::SelectHome => {
+                if let Some(edit) = &mut self.edit {
+                    edit.on_move_x(&config.text_edit_cfg, isize::MIN, true);
+                    CommandResult::Redraw
+                } else { CommandResult::None }
+            }
+            UserCommand::SelectEnd => {
+                if let Some(edit) = &mut self.edit {
+                    edit.on_move_x(&config.text_edit_cfg, isize::MAX, true);
+                    CommandResult::Redraw
+                } else { CommandResult::None }
+            }
+            UserCommand::SelectVertically(delta) => {
+                if let Some(edit) = &mut self.edit {
+                    edit.on_move_y(&config.text_edit_cfg, delta, true);
+                    *cursor_pos = edit.cursor_line(&config.text_edit_cfg);
+                    CommandResult::Redraw
+                } else { CommandResult::None }
+            }
+            UserCommand::AddCursor(delta) => {
+                if let Some(edit) = &mut self.edit {
+                    edit.add_cursor(&config.text_edit_cfg, delta as isize);
+                    *cursor_pos = edit.cursor_line(&config.text_edit_cfg);
+                    CommandResult::Redraw
+                } else { CommandResult::None }
+            }
+            UserCommand::Undo => {
+                if let Some(edit) = &mut self.edit {
+                    edit.undo(&config.text_edit_cfg);
+                    *cursor_pos = edit.cursor_line(&config.text_edit_cfg);
+                    CommandResult::Redraw
+                } else { CommandResult::None }
+            }
+            UserCommand::Redo => {
+                if let Some(edit) = &mut self.edit {
+                    edit.redo(&config.text_edit_cfg);
+                    *cursor_pos = edit.cursor_line(&config.text_edit_cfg);
+                    CommandResult::Redraw
+                } else { CommandResult::None }
+            }
+            UserCommand::FocusLost => { // the cursor moved to another field
+                if let Some(edit) = &mut self.edit {
+                    edit.clear_cursors();
+                    // commit the typed text: the editor stays open in the background,
+                    // but the data must not be lost when the document is saved or
+                    // another editor is closed (both rebuild the layouts)
+                    let mut modified = true;
+                    if let Some(field) = root.get_field(&path.0) {
+                        if let FieldValue::SCALAR(ScalarValue::STR(value)) = &field.value {
+                            modified = *value != edit.view.lines.text;
+                        }
+                    }
+                    if modified {
+                        let new_field_value = FieldValue::SCALAR(ScalarValue::STR(edit.view.lines.text.clone()));
+                        CommandResult::ChangeData(Change { path: path.clone(), action: ChangeType::Overwrite(new_field_value) })
+                    } else { CommandResult::Redraw }
+                } else { CommandResult::None }
+            }
+            UserCommand::FocusGained(column, from_below) => {
+                if let Some(edit) = &mut self.edit {
+                    // continue the vertical movement started in the editor of a
+                    // neighboring field at the same column
+                    let y = if from_below { edit.view.lines.height(&config.text_edit_cfg) - 1 } else { 0 };
+                    edit.set_cursor_at(&config.text_edit_cfg, column as usize, y);
+                    *cursor_pos = edit.cursor_line(&config.text_edit_cfg);
+                    CommandResult::Redraw
+                } else { CommandResult::None }
+            }
+
             UserCommand::DeleteData(backspace) => {
                 if let Some(edit) = &mut self.edit {
                     edit.on_delete(&config.text_edit_cfg, backspace);
+                    // deleting a selection or a '\n' can move the cursor to another line
+                    *cursor_pos = edit.cursor_line(&config.text_edit_cfg);
                     CommandResult::Redraw
                 } else {
                     on_command_default_handler(root, path, amount, command, config, width, indent, cursor_x, cursor_pos)
@@ -887,9 +1029,16 @@ impl ViewLayout for StringLayout {
 
             UserCommand::Exit => { // on first press Esc exit editor, on the second close app
                 if let Some(edit) = &mut self.edit {
-                    let new_field_value = FieldValue::SCALAR(ScalarValue::STR(edit.view.lines.text.clone()));
-                    self.edit = None;
-                    CommandResult::ChangeData(Change { path: path.clone(), action: ChangeType::Overwrite(new_field_value) })
+                    if edit.selected.len() > 1 {
+                        // in multi-cursor mode Esc first drops the additional cursors,
+                        // the editor stays open with the active cursor only
+                        edit.collapse_cursors();
+                        CommandResult::Redraw
+                    } else {
+                        let new_field_value = FieldValue::SCALAR(ScalarValue::STR(edit.view.lines.text.clone()));
+                        self.edit = None;
+                        CommandResult::ChangeData(Change { path: path.clone(), action: ChangeType::Overwrite(new_field_value) })
+                    }
                 } else { CommandResult::Exit }
             }
 
@@ -1293,7 +1442,8 @@ impl TextStyle {
             TextStyle::FieldName => Color::Green,
             TextStyle::SelectedValue |
             TextStyle::SelectedFieldIndex |
-            TextStyle::SelectedFieldName => Color::Black,
+            TextStyle::SelectedFieldName |
+            TextStyle::EditCursor => Color::Black,
             TextStyle::FieldIndex |
             TextStyle::Divider => Color::DarkGrey,
             TextStyle::Value => Color::White, // Color::AnsiValue(230), // https://www.ditig.com/256-colors-cheat-sheet
@@ -1306,6 +1456,7 @@ impl TextStyle {
 
         let background_color = match self {
             TextStyle::TopLine => Color::DarkCyan,
+            TextStyle::EditCursor => Color::Grey, // static reverse-video cell, does not blink
             TextStyle::SelectedValue |
             TextStyle::SelectedFieldName |
             TextStyle::SelectedFieldIndex |
@@ -1356,6 +1507,14 @@ impl LayoutParams {
     pub fn get_text_edit_cursor(&self) -> Option<(u16, usize)> {
         if let Some(layout) = &self.layout {
             layout.get_text_edit_cursor()
+        } else {
+            None
+        }
+    }
+
+    pub fn get_preferred_column(&self) -> Option<u16> {
+        if let Some(layout) = &self.layout {
+            layout.get_preferred_column()
         } else {
             None
         }
@@ -1667,6 +1826,19 @@ impl Layouts {
     }
 
     pub fn update_after_data_changed(&mut self, root: &MessageData, config: &LayoutConfig, changed_layout: usize) {
+        // take out the layouts with an open in-place editor: the rebuild below
+        // replaces the layout objects, but an open editor (its text, cursor state
+        // and undo history) must survive a data change of a neighboring field;
+        // they are matched back to the new layouts by field path
+        let mut open_editors: Vec<(Vec<FieldPos>, Box<dyn ViewLayout>)> = vec![];
+        for item in &mut self.items {
+            if item.get_text_edit_cursor().is_some() {
+                if let Some(layout) = item.layout.take() {
+                    open_editors.push((item.path.0.clone(), layout));
+                }
+            }
+        }
+
         let mut negotiator = self.start_indent_update();
 
         // when a field changed, recreate layout of the parent message.
@@ -1701,6 +1873,14 @@ impl Layouts {
             self.top_layouts_count = Self::calc_top_layouts_count(&items);
             self.items = items;
         }
+
+        // put the editors back into the layouts of the same fields
+        // (an editor of a field that disappeared is dropped)
+        for (path, layout) in open_editors {
+            if let Some(item) = self.items.iter_mut().find(|item| item.path.0 == path) {
+                item.layout = Some(layout);
+            }
+        }
         self.indents = negotiator.into();
     }
 
@@ -1714,10 +1894,25 @@ impl Layouts {
         CommandResult::None
     }
 
+    // the selected layout is changing: tell the old one to drop its editor cursors
+    // and selection (an inactive editor stores no cursor information).
+    // An editor with modified text answers with ChangeData committing the text —
+    // the caller must return it to the App
+    fn notify_focus_lost(&mut self, root: &MessageData, config: &LayoutConfig, old_layout: usize) -> CommandResult {
+        let Some(item) = self.items.get(old_layout) else { return CommandResult::None; };
+        let Some(&indent) = self.indents.get(item.level() - 1) else { debug_assert!(false); return CommandResult::None; };
+        // the cursor coordinates are not meaningful for an unselected layout
+        let (mut unused_x, mut unused_y) = (0u16, 0usize);
+        self.items[old_layout].on_command(root, UserCommand::FocusLost, config, self.width, indent, &mut unused_x, &mut unused_y)
+    }
+
     pub fn run_command(&mut self, command: UserCommand, root: &MessageData, config: &LayoutConfig, selection: &mut Selection) -> CommandResult {
         match &command {
             UserCommand::ScrollVertically(mut delta) => {
+                let old_layout = selection.layout;
+                let moving_up = delta < 0;
                 let mut from_beneath = false;
+                let mut move_in_layout = false; // the movement continues inside the reached layout
 
                 while delta != 0 {
                     if let Some(current) = self.items.get(selection.layout) {
@@ -1725,7 +1920,8 @@ impl Layouts {
                         if delta > 0 { // cursor moving down
                             if (selection.y + delta as usize) < current.height {
                                 debug_assert!(selection.y < current.height);
-                                return self.run_active_layout_command(command, root, config, selection);
+                                move_in_layout = true;
+                                break;
                             }
                             delta -= current.height as isize - selection.y as isize;
 
@@ -1740,7 +1936,8 @@ impl Layouts {
                             if from_beneath { selection.y = current.height - 1; }
 
                             if selection.y >= -delta as usize {
-                                return self.run_active_layout_command(command, root, config, selection);
+                                move_in_layout = true;
+                                break;
                             }
                             delta += (selection.y + 1) as isize;
 
@@ -1756,19 +1953,55 @@ impl Layouts {
                         break;
                     }
                 }
+
+                if selection.layout != old_layout {
+                    // capture the column before FocusLost clears the editor cursors
+                    let column = self.items.get(old_layout).and_then(|item| item.get_preferred_column());
+                    let focus_result = self.notify_focus_lost(root, config, old_layout);
+                    if let Some(column) = column {
+                        // the old layout had an open editor: if the new one has too,
+                        // the cursor continues at the same column, so neighboring
+                        // editors feel like one text
+                        self.run_active_layout_command(UserCommand::FocusGained(column, moving_up), root, config, selection);
+                    }
+                    // the unfocused editor commits its modified text; the App applies
+                    // it and rebuilds the layouts (open editors survive the rebuild,
+                    // see update_after_data_changed)
+                    if let CommandResult::ChangeData(change) = focus_result {
+                        return CommandResult::ChangeData(change);
+                    }
+                    if column.is_some() {
+                        return CommandResult::Redraw;
+                    }
+                }
+                if move_in_layout {
+                    return self.run_active_layout_command(command, root, config, selection);
+                }
                 CommandResult::Redraw
             }
 
             UserCommand::ScrollSibling(delta) => {
+                let old_layout = selection.layout;
                 self.scroll_sibling(*delta, selection);
+                if selection.layout != old_layout {
+                    if let CommandResult::ChangeData(change) = self.notify_focus_lost(root, config, old_layout) {
+                        return CommandResult::ChangeData(change);
+                    }
+                }
                 CommandResult::Redraw
             }
 
             UserCommand::ScrollToBottom => {
                 self.ensure_loaded(root, config, self.items.len() - 1, (2 * self.height + 1) as usize, 0, selection);
+                let old_layout = selection.layout;
                 selection.layout = self.items.len() - 1;
                 selection.y = self.items[selection.layout].height - 1;
                 selection.x = 0;
+                if selection.layout != old_layout {
+                    if let CommandResult::ChangeData(change) = self.notify_focus_lost(root, config, old_layout) {
+                        return CommandResult::ChangeData(change);
+                    }
+                }
                 CommandResult::Redraw
             }
 
