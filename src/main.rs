@@ -228,8 +228,8 @@ impl App {
                         self.layouts.save_document(&self.data)?
                     }
                     3 => {
-                        // change self.layout_config.format;
-                        todo!();
+                        // TODO change self.layout_config.format; no renderer reads it yet
+                        false
                     }
                     4 => {
                         let new_order =
@@ -579,7 +579,7 @@ fn exit_with_error<T: std::fmt::Display>(message: T, code: i32) {
 #[command(
     version,
     about,
-    long_about = "\nTerminal-based protobuf data files editor.\nhttps://github.com/friend2025/protoedit"
+    long_about = "\nTerminal-based protobuf data files editor.\nhttps://github.com/safval/protoedit"
 )]
 struct Args {
     /// Input file: data.pb{;format.proto{;message_name}}
