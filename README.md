@@ -2,7 +2,7 @@
 
 Terminal-based [protobuf](https://protobuf.dev) data files editor.
 
-Current version works as viewer, not all data type editable yet.
+Current version works as viewer, some data type (enum) is not editable yet.
 
 ## Command Line Interface
 
@@ -62,3 +62,8 @@ Type `protoedit filename.pb` to open a file (or `cargo run --release -- resource
  * mega.pb - 1 million random values in three-level structures
  * test_data_1.pb - simple nested data example
 
+## Install
+
+The app is published on [crates.io](https://crates.io/crates/protoedit).
+
+Command `cargo install protoedit` will globally install the protoedit binary.
