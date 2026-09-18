@@ -155,10 +155,23 @@ impl CommonFieldProto {
     }
 }
 
+// shared by the `parse` implementations of the numeric field types
+fn parse_number<T: std::str::FromStr>(text: &str, typename: &str) -> Result<T, String> {
+    text.parse::<T>().map_err(|_| format!("'{}' is not a valid {}", text, typename))
+}
+
 pub trait FieldProto {
     fn read(&self, reader: &mut dyn PbReaderTrait, limit: &mut u32, field_len: u32) -> io::Result<ScalarValue>;
     // write only data, without field name and length
     fn write(&self, writer: &mut dyn io::Write, data: &ScalarValue) -> io::Result<()>;
+    // === support of the in-place editor of ScalarLayout ===
+    // the type can be edited in place
+    fn editable(&self) -> bool { false }
+    // characters the in-place editor accepts while typing a value of this type
+    fn is_edit_char(&self, _: char) -> bool { false }
+    // parse the text of the in-place editor into this type's ScalarValue variant;
+    // Err holds a message for the status line
+    fn parse(&self, _: &str) -> Result<ScalarValue, String> { Err(format!("{} is not editable", self.typename())) }
     fn name(&self) -> String { self.get_common_definition().name.clone() }
     fn typename(&self) -> String;
     fn id(&self) -> i32 { self.get_common_definition().id }
@@ -206,6 +219,9 @@ impl FieldProto for Int32FieldProto {
         } else { unreachable!() }
     }
     fn typename(&self) -> String { "int32".to_string() }
+    fn editable(&self) -> bool { true }
+    fn is_edit_char(&self, c: char) -> bool { c.is_ascii_digit() || c == '-' }
+    fn parse(&self, text: &str) -> Result<ScalarValue, String> { Ok(ScalarValue::I32(parse_number(text, "int32")?)) }
     fn default(&self) -> FieldValue { FieldValue::SCALAR(ScalarValue::I32(0)) }
     fn get_common_definition(&self) -> &CommonFieldProto { &self.0 }
 }
@@ -226,6 +242,9 @@ impl FieldProto for UInt32FieldProto {
         } else { unreachable!() }
     }
     fn typename(&self) -> String { "uint32".to_string() }
+    fn editable(&self) -> bool { true }
+    fn is_edit_char(&self, c: char) -> bool { c.is_ascii_digit() }
+    fn parse(&self, text: &str) -> Result<ScalarValue, String> { Ok(ScalarValue::U32(parse_number(text, "uint32")?)) }
     fn default(&self) -> FieldValue { FieldValue::SCALAR(ScalarValue::U32(0)) }
     fn get_common_definition(&self) -> &CommonFieldProto { &self.0 }
 }
@@ -251,6 +270,13 @@ impl FieldProto for SInt32FieldProto {
         unreachable!()
     }
     fn typename(&self) -> String { "sint32".to_string() }
+    fn editable(&self) -> bool { true }
+    fn is_edit_char(&self, c: char) -> bool { c.is_ascii_digit() || c == '-' }
+    fn parse(&self, text: &str) -> Result<ScalarValue, String> {
+        let value: i32 = parse_number(text, "sint32")?;
+        if value < Self::MIN { return Err(format!("sint32 minimum is {}", Self::MIN)); }
+        Ok(ScalarValue::S32(value))
+    }
     fn default(&self) -> FieldValue { FieldValue::SCALAR(ScalarValue::S32(0)) }
     fn get_common_definition(&self) -> &CommonFieldProto { &self.0 }
 }
@@ -274,6 +300,9 @@ impl FieldProto for FixedInt32FieldProto {
         } else { unreachable!() }
     }
     fn typename(&self) -> String { "sfixed32".to_string() }
+    fn editable(&self) -> bool { true }
+    fn is_edit_char(&self, c: char) -> bool { c.is_ascii_digit() || c == '-' }
+    fn parse(&self, text: &str) -> Result<ScalarValue, String> { Ok(ScalarValue::SF32(parse_number(text, "sfixed32")?)) }
     fn wire_type(&self) -> u8 { WT_I32 }
     fn default(&self) -> FieldValue { FieldValue::SCALAR(ScalarValue::SF32(0)) }
     fn get_common_definition(&self) -> &CommonFieldProto { &self.0 }
@@ -298,6 +327,9 @@ impl FieldProto for FixedUInt32FieldProto {
         } else { unreachable!() }
     }
     fn typename(&self) -> String { "fixed32".to_string() }
+    fn editable(&self) -> bool { true }
+    fn is_edit_char(&self, c: char) -> bool { c.is_ascii_digit() }
+    fn parse(&self, text: &str) -> Result<ScalarValue, String> { Ok(ScalarValue::UF32(parse_number(text, "fixed32")?)) }
     fn wire_type(&self) -> u8 { WT_I32 }
     fn default(&self) -> FieldValue { FieldValue::SCALAR(ScalarValue::UF32(0)) }
     fn get_common_definition(&self) -> &CommonFieldProto { &self.0 }
@@ -320,6 +352,9 @@ impl FieldProto for Int64FieldProto {
         } else { unreachable!() }
     }
     fn typename(&self) -> String { "int64".to_string() }
+    fn editable(&self) -> bool { true }
+    fn is_edit_char(&self, c: char) -> bool { c.is_ascii_digit() || c == '-' }
+    fn parse(&self, text: &str) -> Result<ScalarValue, String> { Ok(ScalarValue::I64(parse_number(text, "int64")?)) }
     fn default(&self) -> FieldValue { FieldValue::SCALAR(ScalarValue::I64(0)) }
     fn get_common_definition(&self) -> &CommonFieldProto { &self.0 }
 }
@@ -341,6 +376,9 @@ impl FieldProto for UInt64FieldProto {
         } else { unreachable!() }
     }
     fn typename(&self) -> String { "uint64".to_string() }
+    fn editable(&self) -> bool { true }
+    fn is_edit_char(&self, c: char) -> bool { c.is_ascii_digit() }
+    fn parse(&self, text: &str) -> Result<ScalarValue, String> { Ok(ScalarValue::U64(parse_number(text, "uint64")?)) }
     fn default(&self) -> FieldValue { FieldValue::SCALAR(ScalarValue::U64(0)) }
     fn get_common_definition(&self) -> &CommonFieldProto { &self.0 }
 }
@@ -365,6 +403,13 @@ impl FieldProto for SInt64FieldProto {
         unreachable!()
     }
     fn typename(&self) -> String { "sint64".to_string() }
+    fn editable(&self) -> bool { true }
+    fn is_edit_char(&self, c: char) -> bool { c.is_ascii_digit() || c == '-' }
+    fn parse(&self, text: &str) -> Result<ScalarValue, String> {
+        let value: i64 = parse_number(text, "sint64")?;
+        if value < Self::MIN { return Err(format!("sint64 minimum is {}", Self::MIN)); }
+        Ok(ScalarValue::S64(value))
+    }
     fn default(&self) -> FieldValue { FieldValue::SCALAR(ScalarValue::S64(0)) }
     fn get_common_definition(&self) -> &CommonFieldProto { &self.0 }
 }
@@ -388,6 +433,9 @@ impl FieldProto for FixedInt64FieldDefinition {
         } else { unreachable!() }
     }
     fn typename(&self) -> String { "sfixed64".to_string() }
+    fn editable(&self) -> bool { true }
+    fn is_edit_char(&self, c: char) -> bool { c.is_ascii_digit() || c == '-' }
+    fn parse(&self, text: &str) -> Result<ScalarValue, String> { Ok(ScalarValue::SF64(parse_number(text, "sfixed64")?)) }
     fn wire_type(&self) -> u8 { WT_I64 }
     fn default(&self) -> FieldValue { FieldValue::SCALAR(ScalarValue::SF64(0)) }
     fn get_common_definition(&self) -> &CommonFieldProto { &self.0 }
@@ -412,6 +460,9 @@ impl FieldProto for FixedUInt64FieldDefinition {
         } else { unreachable!() }
     }
     fn typename(&self) -> String { "fixed64".to_string() }
+    fn editable(&self) -> bool { true }
+    fn is_edit_char(&self, c: char) -> bool { c.is_ascii_digit() }
+    fn parse(&self, text: &str) -> Result<ScalarValue, String> { Ok(ScalarValue::UF64(parse_number(text, "fixed64")?)) }
     fn wire_type(&self) -> u8 { WT_I64 }
     fn default(&self) -> FieldValue { FieldValue::SCALAR(ScalarValue::UF64(0)) }
     fn get_common_definition(&self) -> &CommonFieldProto { &self.0 }
@@ -432,6 +483,10 @@ impl FieldProto for FloatFieldDefinition {
         } else { unreachable!() }
     }
     fn typename(&self) -> String { "float".to_string() }
+    fn editable(&self) -> bool { true }
+    // letters allow "inf" and "NaN", the exponent form uses 'e'
+    fn is_edit_char(&self, c: char) -> bool { c.is_ascii_digit() || "-+.eEinfaN".contains(c) }
+    fn parse(&self, text: &str) -> Result<ScalarValue, String> { Ok(ScalarValue::F32(parse_number(text, "float")?)) }
     fn wire_type(&self) -> u8 { WT_I32 }
     fn default(&self) -> FieldValue { FieldValue::SCALAR(ScalarValue::F32(0.0)) }
     fn get_common_definition(&self) -> &CommonFieldProto { &self.0 }
@@ -452,6 +507,10 @@ impl FieldProto for DoubleFieldDefinition {
         } else { unreachable!() }
     }
     fn typename(&self) -> String { "double".to_string() }
+    fn editable(&self) -> bool { true }
+    // letters allow "inf" and "NaN", the exponent form uses 'e'
+    fn is_edit_char(&self, c: char) -> bool { c.is_ascii_digit() || "-+.eEinfaN".contains(c) }
+    fn parse(&self, text: &str) -> Result<ScalarValue, String> { Ok(ScalarValue::F64(parse_number(text, "double")?)) }
     fn wire_type(&self) -> u8 { WT_I64 }
     fn default(&self) -> FieldValue { FieldValue::SCALAR(ScalarValue::F64(0.0)) }
     fn get_common_definition(&self) -> &CommonFieldProto { &self.0 }
@@ -471,6 +530,15 @@ impl FieldProto for BoolFieldDefinition {
         unreachable!()
     }
     fn typename(&self) -> String { "bool".to_string() }
+    fn editable(&self) -> bool { true }
+    fn is_edit_char(&self, c: char) -> bool { "truefalse01".contains(c) }
+    fn parse(&self, text: &str) -> Result<ScalarValue, String> {
+        match text {
+            "true" | "1" => Ok(ScalarValue::BOOL(true)),
+            "false" | "0" => Ok(ScalarValue::BOOL(false)),
+            _ => Err(format!("'{}' is not a bool (true/false)", text)),
+        }
+    }
     fn default(&self) -> FieldValue { FieldValue::SCALAR(ScalarValue::BOOL(false)) }
     fn get_common_definition(&self) -> &CommonFieldProto { &self.0 }
 }

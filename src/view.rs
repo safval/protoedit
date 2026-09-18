@@ -88,12 +88,13 @@ pub enum UserCommand
     KeyPress(char),
     // internal commands, sent by Layouts (not bound to keys) when the cursor
     // moves from one layout to another: the old layout drops its editor cursors
-    // and selection, the new one — if an editor is open in both — continues at
-    // the given preferred column, so neighboring editors feel like one text.
+    // and selection, the new one continues at the remembered column (the
+    // preferred_column argument of on_command), so neighboring editors feel
+    // like one text and neighboring value lines like one grid.
     // The bool of FocusGained is true when the cursor enters from the layout
-    // below (moving up), so the editor cursor goes to its last line
+    // below (moving up), so the cursor goes to the last line of the layout
     FocusLost,
-    FocusGained(u16, bool),
+    FocusGained(bool),
 }
 
 pub enum CommandResult {
@@ -159,16 +160,17 @@ pub trait ViewLayout {
     fn get_screen(&self, root: &MessageData, path: &FieldPath, amount: usize, width: u16, indent: u16, config: &LayoutConfig, cursor: Option<(u16, usize)>) -> ScreenLines;
     // the blinking cursor of the terminal will be shown in this position, position in this layout, not screen
     fn get_text_edit_cursor(&self) -> Option<(u16, usize)> { None }
-    // preferred cursor column of an open in-place editor; used to keep the column
-    // when the focus moves vertically between editors of neighboring fields
-    fn get_preferred_column(&self) -> Option<u16> { None }
-    fn on_command(&mut self, root: &MessageData, path: &FieldPath, amount: usize, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult;
+    // preferred cursor column of an open in-place editor or of the selected value;
+    // used to keep the column when the focus moves vertically between neighboring
+    // fields (the selection itself is stored globally, not in the layout)
+    fn get_preferred_column(&self, _cursor_x: u16, _cursor_pos: usize) -> Option<u16> { None }
+    fn on_command(&mut self, root: &MessageData, path: &FieldPath, amount: usize, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, preferred_column: Option<u16>, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult;
     // get ids of children fields already shown in this layout
     fn get_consumed_fields(&self, root: &MessageData, path: &FieldPath, config: &LayoutConfig) -> HashSet<i32> { HashSet::new() }
     fn get_status_string(&self, cursor_x: u16, cursor_y: usize) -> String { String::new() }
 }
 
-fn on_command_default_handler(root: &MessageData, path: &FieldPath, amount: usize, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult {
+fn on_command_default_handler(root: &MessageData, path: &FieldPath, amount: usize, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, preferred_column: Option<u16>, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult {
     match command {
         UserCommand::DeleteData(backspace) => {
             if *cursor_x == 0 && *cursor_pos == 0 {
@@ -193,7 +195,48 @@ fn on_command_default_handler(root: &MessageData, path: &FieldPath, amount: usiz
 // bool, enum, integral, or real value: single, none or repeated
 // there are special layouts for text and hex field types
 pub struct ScalarLayout {
-    line_lens: Vec<usize>, // how many scalar values of each line on the screen
+    // screen placement of the values: one Vec per screen line, one
+    // (start column, length) per value on that line
+    spans: Vec<Vec<(u16, u16)>>,
+    edit: Option<ScalarEditor>,
+}
+
+// in-place editor of one scalar (numeric or bool) value inside a ScalarLayout;
+// it edits plain text, the field's FieldProto parses it on commit
+#[derive(Debug)]
+struct ScalarEditor {
+    text: Vec<char>,
+    cursor: usize, // position in text, 0..=text.len()
+    index: usize,  // which of the layout's values is edited
+    line: usize,   // layout line the value is shown on
+    x_base: u16,   // offset of the value's first char in the value area of the line
+    error: Option<String>, // failed commit message, shown in the status line
+}
+impl ScalarEditor {
+    fn new(text: String, index: usize, line: usize, x_base: u16) -> ScalarEditor {
+        let text: Vec<char> = text.chars().collect();
+        ScalarEditor { cursor: text.len(), text, index, line, x_base, error: None }
+    }
+    fn text(&self) -> String { self.text.iter().collect() }
+    fn on_char(&mut self, c: char) {
+        self.text.insert(self.cursor, c);
+        self.cursor += 1;
+        self.error = None;
+    }
+    fn on_delete(&mut self, backspace: bool) {
+        if backspace {
+            if self.cursor > 0 {
+                self.cursor -= 1;
+                self.text.remove(self.cursor);
+            }
+        } else if self.cursor < self.text.len() {
+            self.text.remove(self.cursor);
+        }
+        self.error = None;
+    }
+    fn move_x(&mut self, delta: isize) {
+        self.cursor = self.cursor.saturating_add_signed(delta).min(self.text.len());
+    }
 }
 pub struct StringLayout {
     edit: Option<TextEditor>,
@@ -472,7 +515,7 @@ impl ScalarLayout {
     const MARGIN: u16 = MARGIN_LEFT + MARGIN_RIGHT;
 
     fn new() -> Self {
-        ScalarLayout { line_lens: vec![] }
+        ScalarLayout { spans: vec![], edit: None }
     }
     fn add_scalar_value(line: &mut ScreenLine, value: &ScalarValue, def: &FieldProtoPtr, config: &LayoutConfig, selected: bool) {
         line.0.push((' ', TextStyle::Divider));
@@ -496,17 +539,16 @@ impl ScalarLayout {
         }
     }
 
-    fn get_line_lens(&self, full_width: u16, indent: u16, def: &FieldProtoPtr, msg: &MessageData, path: &FieldPath, amount: usize, config: &LayoutConfig) -> Vec<usize> {
+    fn get_value_spans(&self, full_width: u16, indent: u16, def: &FieldProtoPtr, msg: &MessageData, path: &FieldPath, amount: usize, config: &LayoutConfig) -> Vec<Vec<(u16, u16)>> {
         let mut avail_width = (full_width - indent - Self::MARGIN) as usize;
         if def.repeated() { avail_width -= 1 }
         avail_width -= def.typename().len();
 
         debug_assert!(amount > 0);
         let mut cur_len = 0;
-        //let mut line_count = 1;
 
-        let mut starts = vec![];
-        let mut prv_line_end = 0;
+        let mut spans = vec![];
+        let mut line = vec![];
 
         if let Some(last_pos) = path.0.last() {
             for index in last_pos.index..last_pos.index + amount {
@@ -517,43 +559,112 @@ impl ScalarLayout {
                         cur_len += len + 1;
                         if cur_len >= avail_width {
                             cur_len = len + 1;
-                            //line_count += 1;
-                            starts.push(index - prv_line_end);
-                            prv_line_end = index;
+                            spans.push(mem::take(&mut line));
                             avail_width = (full_width - indent - Self::MARGIN) as usize;
                         }
+                        line.push(((cur_len - len - 1) as u16, len as u16));
                     }
                 }
             }
-            let last_line_len = last_pos.index + amount - prv_line_end;
-            if last_line_len > 0 { starts.push(last_line_len) }
+            if !line.is_empty() { spans.push(line) }
         }
 
-        starts //line_count
+        spans
     }
 
     fn data_index_at_cursor(&self, cursor_x: u16, mut cursor_y: usize) -> usize {
         if cursor_x == 0 { return usize::MAX; } // selected field name, no data
-        let at_line_start: usize = self.line_lens.iter().take(cursor_y).map(|i| *i as usize).sum();
+        let at_line_start: usize = self.spans.iter().take(cursor_y).map(|line| line.len()).sum();
         at_line_start + cursor_x as usize - 1
     }
 
     fn cursor_at_data_index(&self, index: usize) -> (u16, usize) {
         let mut sum = 0;
-        for line_index in 0..self.line_lens.len() {
-            let line_len = self.line_lens[line_index];
+        for line_index in 0..self.spans.len() {
+            let line_len = self.spans[line_index].len();
             if sum + line_len >= index {
                 return ((index - sum + 1) as u16, line_index);
             }
             sum += line_len;
         }
-        (0, self.line_lens.len())
+        (0, self.spans.len())
+    }
+
+    // the value of a line at the given screen column: a value is matched by its
+    // span plus the following space, a column beyond the line end selects the
+    // last value, an empty line the field name (0)
+    fn value_at_column(line: &[(u16, u16)], column: u16) -> u16 {
+        for (i, &(start, len)) in line.iter().enumerate() {
+            if column < start + len + 1 { return (i + 1) as u16 }
+        }
+        line.len() as u16
+    }
+
+    // open the in-place editor for the value under the cursor;
+    // prefill puts the current value text into the editor (Enter),
+    // without it the editor opens empty to replace the value with the typed text
+    fn open_editor(&mut self, root: &MessageData, path: &FieldPath, amount: usize, config: &LayoutConfig, cursor_x: u16, cursor_pos: usize, prefill: bool) -> bool {
+        let Some(def) = root.get_field_definition(path) else { return false };
+        if !def.editable() { return false }
+        let index = self.data_index_at_cursor(cursor_x, cursor_pos);
+        if index == usize::MAX || (amount > 0 && index >= amount) { return false }
+        let Some(&(x_base, _)) = self.spans.get(cursor_pos).and_then(|line| line.get(cursor_x as usize - 1)) else { return false };
+
+        let mut text =
+            if amount == 0 { // the field is absent from the data, its default value is shown
+                let FieldValue::SCALAR(value) = def.default() else { return false };
+                Self::scalar_to_string(&value, &def, config)
+            } else {
+                let p = path.with_last_index(path.0.last().unwrap().index + index);
+                let Some(field) = root.get_field(&p.0) else { return false };
+                let FieldValue::SCALAR(value) = &field.value else { return false };
+                Self::scalar_to_string(value, &def, config)
+            };
+
+        if !prefill { text.clear() }
+        self.edit = Some(ScalarEditor::new(text, index, cursor_pos, x_base));
+        true
+    }
+
+    // parse the editor text and close the editor turning the text into a data
+    // change; empty text reverts the edit; on a parse error the editor stays open
+    // showing the error, unless the focus is leaving (force) and it cannot stay —
+    // then the edit is dropped
+    fn commit_editor(&mut self, root: &MessageData, path: &FieldPath, amount: usize, force: bool) -> CommandResult {
+        let Some(mut edit) = self.edit.take() else { return CommandResult::None };
+        let text = edit.text();
+        if text.is_empty() { return CommandResult::Redraw } // nothing typed: revert
+        let Some(def) = root.get_field_definition(path) else { return CommandResult::Redraw };
+        match def.parse(&text) {
+            Ok(value) => {
+                let path = path.with_last_index(path.0.last().unwrap().index + edit.index);
+                if amount == 0 { // editing the shown default value creates the field
+                    return CommandResult::ChangeData(Change { path, action: ChangeType::Insert(FieldValue::SCALAR(value)) });
+                }
+                if let Some(field) = root.get_field(&path.0) {
+                    if let FieldValue::SCALAR(current) = &field.value {
+                        if *current == value { return CommandResult::Redraw } // unchanged
+                    }
+                }
+                CommandResult::ChangeData(Change { path, action: ChangeType::Overwrite(FieldValue::SCALAR(value)) })
+            }
+            Err(message) => {
+                if !force {
+                    edit.error = Some(message);
+                    self.edit = Some(edit);
+                }
+                CommandResult::Redraw
+            }
+        }
     }
 }
 impl ViewLayout for ScalarLayout {
     fn layout_type(&self) -> LayoutType { LayoutType::Scalar }
     fn get_status_string(&self, cursor_x: u16, cursor_y: usize) -> String {
         //format!("/{}", self.amount)
+        if let Some(edit) = &self.edit {
+            if let Some(error) = &edit.error { return error.clone() }
+        }
         String::new()
     }
     fn calc_sizes(&mut self, root: &MessageData, path: &FieldPath, amount: usize, config: &LayoutConfig, width: u16, negotiator: &mut IndentsCalc) -> usize {
@@ -567,9 +678,13 @@ impl ViewLayout for ScalarLayout {
                 let mut p = path.0.clone();
                 p.pop();
                 if let Some(msg) = root.get_submessage(&p) {
-                    self.line_lens = self.get_line_lens(width, indent, &field_proto, msg, path, amount, config);
-                    line_count = self.line_lens.len();
+                    self.spans = self.get_value_spans(width, indent, &field_proto, msg, path, amount, config);
+                    line_count = self.spans.len();
                 }
+            } else if let FieldValue::SCALAR(value) = field_proto.default() {
+                // no data, the default value is shown; it can be selected and
+                // edited (editing an absent field inserts it)
+                self.spans = vec![vec![(0, Self::scalar_to_string(&value, &field_proto, config).len() as u16)]];
             }
             return line_count.max(1); // if no data, default value will be shown
         }
@@ -593,8 +708,11 @@ impl ViewLayout for ScalarLayout {
             let selected_index = cursor.map_or(usize::MAX, |(x, y)| self.data_index_at_cursor(x, y));
 
             if amount == 0 {
-                // no data was read, show default value
-                if let FieldValue::SCALAR(value) = field_def.default() {
+                if let Some(edit) = &self.edit {
+                    line.0.push((' ', TextStyle::Divider));
+                    line.add_string(edit.text(), TextStyle::SelectedValue);
+                } else if let FieldValue::SCALAR(value) = field_def.default() {
+                    // no data was read, show default value
                     Self::add_scalar_value(&mut line, &value, &field_def, config, selected_index == 0);
                 }
             } else {
@@ -625,7 +743,15 @@ impl ViewLayout for ScalarLayout {
                                 line = ScreenLine::new(width);
                                 line.add_value_address(format!("{}", index), indent, &cursor, lines.0.len());
                             }
-                            Self::add_scalar_value(&mut line, value, &field.def, config, selected_index == index);
+                            // the edited value shows the editor text instead of the data;
+                            // the line breaks still follow the data lengths (line_lens)
+                            match &self.edit {
+                                Some(edit) if edit.index == index => {
+                                    line.0.push((' ', TextStyle::Divider));
+                                    line.add_string(edit.text(), TextStyle::SelectedValue);
+                                }
+                                _ => Self::add_scalar_value(&mut line, value, &field.def, config, selected_index == index),
+                            }
                         }
                     }
                     p.last_mut().unwrap().index += 1;
@@ -641,12 +767,75 @@ impl ViewLayout for ScalarLayout {
         lines.0.push(line);
         lines
     }
-    fn on_command(&mut self, root: &MessageData, path: &FieldPath, amount: usize, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult
+    fn get_text_edit_cursor(&self) -> Option<(u16, usize)> {
+        self.edit.as_ref().map(|edit| (edit.x_base + edit.cursor as u16, edit.line))
+    }
+    fn get_preferred_column(&self, cursor_x: u16, cursor_pos: usize) -> Option<u16> {
+        if let Some(edit) = &self.edit {
+            return Some(edit.x_base + edit.cursor as u16);
+        }
+        if cursor_x == 0 { return None } // the field name is selected, no column to keep
+        self.spans.get(cursor_pos).and_then(|line| line.get(cursor_x as usize - 1)).map(|&(start, _)| start)
+    }
+    fn on_command(&mut self, root: &MessageData, path: &FieldPath, amount: usize, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, preferred_column: Option<u16>, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult
     {
         match command {
-            UserCommand::DeleteData(_) => {
-                if *cursor_x == 0 && *cursor_pos == 0 {
-                    on_command_default_handler(root, path, amount, command, config, width, indent, cursor_x, cursor_pos)
+            UserCommand::KeyPress(c) => {
+                let Some(def) = root.get_field_definition(path) else { return CommandResult::None };
+                if !def.is_edit_char(c) { return CommandResult::None }
+                if self.edit.is_none() {
+                    // typing over a value replaces it: the editor opens empty
+                    if !self.open_editor(root, path, amount, config, *cursor_x, *cursor_pos, false) {
+                        return CommandResult::None;
+                    }
+                }
+                self.edit.as_mut().unwrap().on_char(c);
+                CommandResult::Redraw
+            }
+            UserCommand::CollapsedToggle => { // Enter: open the editor on the current value or commit it
+                if self.edit.is_some() {
+                    self.commit_editor(root, path, amount, false)
+                } else if self.open_editor(root, path, amount, config, *cursor_x, *cursor_pos, true) {
+                    CommandResult::Redraw
+                } else { CommandResult::None }
+            }
+            UserCommand::Exit => { // Esc commits and closes the editor, without one it closes the app
+                if self.edit.is_some() {
+                    self.commit_editor(root, path, amount, false)
+                } else { CommandResult::Exit }
+            }
+            UserCommand::FocusLost => // the cursor moved to another field
+                self.commit_editor(root, path, amount, true),
+            UserCommand::FocusGained(from_below) => {
+                // select (not edit) the value at the remembered column, so vertical
+                // movement keeps the screen column
+                let Some(column) = preferred_column else { return CommandResult::None };
+                let y = if from_below { self.spans.len().max(1) - 1 } else { 0 };
+                if let Some(line) = self.spans.get(y) {
+                    *cursor_x = Self::value_at_column(line, column);
+                    *cursor_pos = y;
+                    CommandResult::Redraw
+                } else { CommandResult::None }
+            }
+            UserCommand::ScrollVertically(delta) => {
+                // the editor cannot follow the cursor to another line: commit it
+                let result = self.commit_editor(root, path, amount, true);
+                *cursor_pos = (*cursor_pos as isize + delta) as usize;
+                if *cursor_x > 0 {
+                    // moving between the lines of this layout also aims at the
+                    // remembered column
+                    if let (Some(column), Some(new_line)) = (preferred_column, self.spans.get(*cursor_pos)) {
+                        *cursor_x = Self::value_at_column(new_line, column);
+                    }
+                }
+                if let CommandResult::ChangeData(_) = result { result } else { CommandResult::Redraw }
+            }
+            UserCommand::DeleteData(backspace) => {
+                if let Some(edit) = &mut self.edit {
+                    edit.on_delete(backspace);
+                    CommandResult::Redraw
+                } else if *cursor_x == 0 && *cursor_pos == 0 {
+                    on_command_default_handler(root, path, amount, command, config, width, indent, preferred_column, cursor_x, cursor_pos)
                 } else {
                     let index = self.data_index_at_cursor(*cursor_x, *cursor_pos);
                     if amount > 0 && index > 0 && index == amount - 1 {
@@ -654,22 +843,26 @@ impl ViewLayout for ScalarLayout {
                         (*cursor_x, *cursor_pos) = self.cursor_at_data_index(index - 1);
                     }
                     let path = path.with_last_index(path.0.last().unwrap().index + index);
-                    self.line_lens.clear();
+                    self.spans.clear();
                     CommandResult::ChangeData(Change { path, action: ChangeType::Delete })
                 }
             }
             UserCommand::InsertData => {
+                if self.edit.is_some() { return CommandResult::None }
                 let index = self.data_index_at_cursor(*cursor_x, *cursor_pos);
                 let path = path.with_last_index(path.0.last().unwrap().index + index + 1);
                 (*cursor_x, *cursor_pos) = self.cursor_at_data_index(index + 1);
-                self.line_lens.clear();
+                self.spans.clear();
                 let def = root.get_field_definition(&path).unwrap();
                 CommandResult::ChangeData(Change { path: path.clone(), action: ChangeType::Insert(def.default()) })
             }
             UserCommand::ScrollHorizontally(delta) => {
-                if let Some(len) = self.line_lens.get(*cursor_pos) {
+                if let Some(edit) = &mut self.edit {
+                    edit.move_x(delta as isize);
+                    CommandResult::Redraw
+                } else if let Some(line) = self.spans.get(*cursor_pos) {
                     if delta > 0 {
-                        *cursor_x = (*cursor_x + delta as u16).min(*len as u16);
+                        *cursor_x = (*cursor_x + delta as u16).min(line.len() as u16);
                     } else { // delta < 0
                         let delta = (-delta as u16).min(*cursor_x);
                         *cursor_x -= delta;
@@ -678,16 +871,22 @@ impl ViewLayout for ScalarLayout {
                 } else { CommandResult::None }
             }
             UserCommand::Home => {
-                *cursor_x = if *cursor_x == 1 { 0 } else { 1 };
-                CommandResult::Redraw
-            }
-            UserCommand::End => {
-                if let Some(len) = self.line_lens.get(*cursor_pos) {
-                    *cursor_x = *len as u16;
+                if let Some(edit) = &mut self.edit {
+                    edit.move_x(isize::MIN);
+                } else {
+                    *cursor_x = if *cursor_x == 1 { 0 } else { 1 };
                 }
                 CommandResult::Redraw
             }
-            _ => on_command_default_handler(root, path, amount, command, config, width, indent, cursor_x, cursor_pos)
+            UserCommand::End => {
+                if let Some(edit) = &mut self.edit {
+                    edit.move_x(isize::MAX);
+                } else if let Some(line) = self.spans.get(*cursor_pos) {
+                    *cursor_x = line.len() as u16;
+                }
+                CommandResult::Redraw
+            }
+            _ => on_command_default_handler(root, path, amount, command, config, width, indent, preferred_column, cursor_x, cursor_pos)
         }
     }
 }
@@ -873,12 +1072,12 @@ impl ViewLayout for StringLayout {
         }
         return None;
     }
-    fn get_preferred_column(&self) -> Option<u16> {
+    fn get_preferred_column(&self, _cursor_x: u16, _cursor_pos: usize) -> Option<u16> {
         self.edit.as_ref()
             .and_then(|edit| edit.selected.get(edit.active_cursor_index))
             .map(|sel| sel.x_pref as u16)
     }
-    fn on_command(&mut self, root: &MessageData, path: &FieldPath, amount: usize, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult
+    fn on_command(&mut self, root: &MessageData, path: &FieldPath, amount: usize, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, preferred_column: Option<u16>, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult
     {
         //        if let Some(field) = root.get_field(&path.0) {
         //            if let FieldValue::SCALAR(ScalarValue::STR(value)) = &field.value {
@@ -977,8 +1176,8 @@ impl ViewLayout for StringLayout {
                     } else { CommandResult::Redraw }
                 } else { CommandResult::None }
             }
-            UserCommand::FocusGained(column, from_below) => {
-                if let Some(edit) = &mut self.edit {
+            UserCommand::FocusGained(from_below) => {
+                if let (Some(edit), Some(column)) = (&mut self.edit, preferred_column) {
                     // continue the vertical movement started in the editor of a
                     // neighboring field at the same column
                     let y = if from_below { edit.view.lines.height(&config.text_edit_cfg) - 1 } else { 0 };
@@ -995,7 +1194,7 @@ impl ViewLayout for StringLayout {
                     *cursor_pos = edit.cursor_line(&config.text_edit_cfg);
                     CommandResult::Redraw
                 } else {
-                    on_command_default_handler(root, path, amount, command, config, width, indent, cursor_x, cursor_pos)
+                    on_command_default_handler(root, path, amount, command, config, width, indent, preferred_column, cursor_x, cursor_pos)
                     //CommandResult::None
                 }
             }
@@ -1042,7 +1241,7 @@ impl ViewLayout for StringLayout {
                 } else { CommandResult::Exit }
             }
 
-            _ => on_command_default_handler(root, path, amount, command, config, width, indent, cursor_x, cursor_pos)
+            _ => on_command_default_handler(root, path, amount, command, config, width, indent, preferred_column, cursor_x, cursor_pos)
         }
     }
 }
@@ -1207,7 +1406,7 @@ impl ViewLayout for BytesLayout {
             Some((x, y))
         } else { None }
     }
-    fn on_command(&mut self, root: &MessageData, path: &FieldPath, amount: usize, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult {
+    fn on_command(&mut self, root: &MessageData, path: &FieldPath, amount: usize, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, preferred_column: Option<u16>, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult {
         match command {
             UserCommand::DeleteData(_) => {
                 if let Some(edit) = &mut self.edit {
@@ -1229,7 +1428,7 @@ impl ViewLayout for BytesLayout {
                         }
                     }
                     self.edit = None;
-                    on_command_default_handler(root, path, amount, command, config, width, indent, cursor_x, cursor_pos) // CommandResult::None
+                    on_command_default_handler(root, path, amount, command, config, width, indent, preferred_column, cursor_x, cursor_pos) // CommandResult::None
                 }
             }
 
@@ -1313,7 +1512,7 @@ impl ViewLayout for BytesLayout {
                 } else { CommandResult::Exit }
             }
 
-            _ => on_command_default_handler(root, path, amount, command, config, width, indent, cursor_x, cursor_pos)
+            _ => on_command_default_handler(root, path, amount, command, config, width, indent, preferred_column, cursor_x, cursor_pos)
         }
     }
 
@@ -1348,11 +1547,11 @@ impl ViewLayout for MessageLayout {
         }
         ScreenLines(vec![line])
     }
-    fn on_command(&mut self, root: &MessageData, path: &FieldPath, amount: usize, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult
+    fn on_command(&mut self, root: &MessageData, path: &FieldPath, amount: usize, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, preferred_column: Option<u16>, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult
     {
         match command {
             //UserCommand::TableTreeToggle => { CommandResult::ChangeLayout(LayoutType::Table) }
-            _ => on_command_default_handler(root, path, amount, command, config, width, indent, cursor_x, cursor_pos)
+            _ => on_command_default_handler(root, path, amount, command, config, width, indent, preferred_column, cursor_x, cursor_pos)
         }
     }
 }
@@ -1375,10 +1574,10 @@ impl ViewLayout for TableLayout {
         }
         ScreenLines(vec![line])
     }
-    fn on_command(&mut self, root: &MessageData, path: &FieldPath, amount: usize, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult
+    fn on_command(&mut self, root: &MessageData, path: &FieldPath, amount: usize, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, preferred_column: Option<u16>, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult
     {
         match command {
-            _ => on_command_default_handler(root, path, amount, command, config, width, indent, cursor_x, cursor_pos)
+            _ => on_command_default_handler(root, path, amount, command, config, width, indent, preferred_column, cursor_x, cursor_pos)
         }
     }
 }
@@ -1407,9 +1606,9 @@ impl ViewLayout for CollapsedLayout {
         //        }
         ScreenLines(vec![line])
     }
-    fn on_command(&mut self, root: &MessageData, path: &FieldPath, amount: usize, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult {
+    fn on_command(&mut self, root: &MessageData, path: &FieldPath, amount: usize, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, preferred_column: Option<u16>, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult {
         match command {
-            _ => on_command_default_handler(root, path, amount, command, config, width, indent, cursor_x, cursor_pos)
+            _ => on_command_default_handler(root, path, amount, command, config, width, indent, preferred_column, cursor_x, cursor_pos)
         }
     }
 
@@ -1512,18 +1711,18 @@ impl LayoutParams {
         }
     }
 
-    pub fn get_preferred_column(&self) -> Option<u16> {
+    pub fn get_preferred_column(&self, cursor_x: u16, cursor_pos: usize) -> Option<u16> {
         if let Some(layout) = &self.layout {
-            layout.get_preferred_column()
+            layout.get_preferred_column(cursor_x, cursor_pos)
         } else {
             None
         }
     }
 
-    pub fn on_command(&mut self, root: &MessageData, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult {
+    pub fn on_command(&mut self, root: &MessageData, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, preferred_column: Option<u16>, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult {
         if let Some(layout) = &mut self.layout {
             match command {
-                _ => layout.on_command(root, &self.path, self.amount, command, config, width, indent, cursor_x, cursor_pos),
+                _ => layout.on_command(root, &self.path, self.amount, command, config, width, indent, preferred_column, cursor_x, cursor_pos),
             }
         } else { CommandResult::None }
     }
@@ -1888,7 +2087,7 @@ impl Layouts {
     {
         if let Some(current) = self.items.get(selection.layout) {
             if let Some(&indent) = self.indents.get(current.level() - 1) {
-                return self.items[selection.layout].on_command(root, command, config, self.width, indent, &mut selection.x, &mut selection.y);
+                return self.items[selection.layout].on_command(root, command, config, self.width, indent, selection.preferred_column, &mut selection.x, &mut selection.y);
             } else { debug_assert!(false); }
         } else { debug_assert!(self.items.is_empty()); }
         CommandResult::None
@@ -1903,11 +2102,14 @@ impl Layouts {
         let Some(&indent) = self.indents.get(item.level() - 1) else { debug_assert!(false); return CommandResult::None; };
         // the cursor coordinates are not meaningful for an unselected layout
         let (mut unused_x, mut unused_y) = (0u16, 0usize);
-        self.items[old_layout].on_command(root, UserCommand::FocusLost, config, self.width, indent, &mut unused_x, &mut unused_y)
+        self.items[old_layout].on_command(root, UserCommand::FocusLost, config, self.width, indent, None, &mut unused_x, &mut unused_y)
     }
 
     pub fn run_command(&mut self, command: UserCommand, root: &MessageData, config: &LayoutConfig, selection: &mut Selection) -> CommandResult {
-        match &command {
+        let vertical_move = matches!(command,
+            UserCommand::ScrollVertically(_) | UserCommand::ScrollSibling(_) | UserCommand::ScrollToBottom);
+
+        let result = match &command {
             UserCommand::ScrollVertically(mut delta) => {
                 let old_layout = selection.layout;
                 let moving_up = delta < 0;
@@ -1955,14 +2157,14 @@ impl Layouts {
                 }
 
                 if selection.layout != old_layout {
-                    // capture the column before FocusLost clears the editor cursors
-                    let column = self.items.get(old_layout).and_then(|item| item.get_preferred_column());
                     let focus_result = self.notify_focus_lost(root, config, old_layout);
-                    if let Some(column) = column {
-                        // the old layout had an open editor: if the new one has too,
-                        // the cursor continues at the same column, so neighboring
-                        // editors feel like one text
-                        self.run_active_layout_command(UserCommand::FocusGained(column, moving_up), root, config, selection);
+                    // the cursor continues at the remembered column. A layout that
+                    // cannot take it (a structure name, or no column is remembered
+                    // because the name column is traveling) ignores the command:
+                    // its name gets selected instead, and the remembered column
+                    // stays for the moves that follow
+                    if let CommandResult::None = self.run_active_layout_command(UserCommand::FocusGained(moving_up), root, config, selection) {
+                        selection.x = 0;
                     }
                     // the unfocused editor commits its modified text; the App applies
                     // it and rebuilds the layouts (open editors survive the rebuild,
@@ -1970,9 +2172,7 @@ impl Layouts {
                     if let CommandResult::ChangeData(change) = focus_result {
                         return CommandResult::ChangeData(change);
                     }
-                    if column.is_some() {
-                        return CommandResult::Redraw;
-                    }
+                    return CommandResult::Redraw;
                 }
                 if move_in_layout {
                     return self.run_active_layout_command(command, root, config, selection);
@@ -2051,13 +2251,17 @@ impl Layouts {
                 }
             }
             _ => self.run_active_layout_command(command, root, config, selection)
+        };
+
+        // vim-style sticky column: any non-vertical command positions the cursor
+        // explicitly, so its screen column becomes the target the vertical moves
+        // aim at; the vertical moves themselves never change it, so a clamp on a
+        // short line does not lose the target. None means the name column (x = 0)
+        // is traveling instead of a value column
+        if !vertical_move {
+            selection.preferred_column = self.items.get(selection.layout).and_then(|item| item.get_preferred_column(selection.x, selection.y));
         }
-
-
-        //        if let Some(current) = self.items.get_mut(selection.layout) {
-        //            let indent = self.indents[current.level() - 1];
-        //            current.on_command(root, command, config, self.width, indent, &mut selection.x, &mut selection.y)
-        //        } else { CommandResult::None }
+        result
     }
 
     pub fn scroll_sibling(&self, delta: i8, selection: &mut Selection) -> bool {

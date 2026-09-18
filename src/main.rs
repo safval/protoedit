@@ -61,9 +61,21 @@ struct Selection {
     layout: usize,
     // y position in the layout
     y: usize,
-    // x coordinate in the layout
-    // 0 if selected the first column with field names
+    // logical x position in the layout, not a screen column; its meaning is
+    // defined by the layout type: the ordinal of the selected value in the line
+    // for ScalarLayout, the byte index for BytesLayout, the editor column for
+    // StringLayout. It addresses a data item, so it survives reflows (resize,
+    // reorder, value width change). The screen column is derived from it only
+    // transiently, when a vertical move crosses layouts and the new layout maps
+    // it back (get_preferred_column -> FocusGained).
+    // 0 always means the first column with the field name
     x: u16,
+    // vim-style sticky column: the screen column set by the last non-vertical
+    // command; vertical moves aim at it but never change it, so it survives
+    // both passing through items without data columns (structure names) and
+    // clamping on lines shorter than the target column.
+    // None means the name column (x = 0) travels instead of a value column
+    preferred_column: Option<u16>,
 }
 
 struct App {
@@ -725,7 +737,7 @@ mod app_tests {
     use crate::App;
     use crate::proto::ProtoData;
     use crate::wire::FieldValue::MESSAGE;
-    use crate::wire::ScalarValue::{BYTES, ENUM, F64, STR};
+    use crate::wire::ScalarValue::{BOOL, BYTES, ENUM, F32, F64, I32, STR, U32};
 
     fn make_minimal_test_data() -> MessageData {
         let binary_input = [];
@@ -2511,6 +2523,336 @@ message M2 { int32 i2 = 2; int32 i3 = 3; }
         assert_eq!(app.to_strings()[0], " f1: 12            bytes ");
     }
 
+
+    #[test]
+    fn type_int32_replaces_value() {
+        let data = make_one_field_data("message M { int32 f1=1; }", I32(123));
+        let mut app = App::for_tests(data.0, data.1, FieldOrder::Proto, 25, 25).unwrap();
+        assert_eq!(app.to_strings(), [" f1: 123           int32 "]);
+
+        // typing on the selected value replaces it
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        app.run_command(KeyPress('4')).unwrap();
+        assert_eq!(app.to_strings(), [
+            " f1: 4             int32 ",
+            "cursor: 6,1"]);
+        app.run_command(KeyPress('5')).unwrap();
+        assert_eq!(app.to_strings(), [
+            " f1: 45            int32 ",
+            "cursor: 7,1"]);
+
+        // Esc closes the editor and applies the change to the data
+        app.run_command(UserCommand::Exit).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [" f1: 45            int32 "]);
+        match &app.data.get_field(&[(1, 0).into()]).unwrap().value {
+            SCALAR(I32(value)) => assert_eq!(*value, 45),
+            _ => panic!("f1 is not an int32"),
+        }
+    }
+
+    #[test]
+    fn enter_edits_int32_in_place() {
+        let data = make_one_field_data("message M { int32 f1=1; }", I32(123));
+        let mut app = App::for_tests(data.0, data.1, FieldOrder::Proto, 25, 25).unwrap();
+
+        // Enter opens the editor with the current value, the cursor at the end
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        app.run_command(CollapsedToggle).unwrap();
+        assert_eq!(app.to_strings(), [
+            " f1: 123           int32 ",
+            "cursor: 8,1"]);
+
+        app.run_command(KeyPress('4')).unwrap();
+        // the second Enter commits like Esc does
+        app.run_command(CollapsedToggle).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [" f1: 1234          int32 "]);
+        match &app.data.get_field(&[(1, 0).into()]).unwrap().value {
+            SCALAR(I32(value)) => assert_eq!(*value, 1234),
+            _ => panic!("f1 is not an int32"),
+        }
+    }
+
+    #[test]
+    fn uint32_out_of_range_keeps_editor_open() {
+        let data = make_one_field_data("message M { uint32 f1=1; }", U32(7));
+        let mut app = App::for_tests(data.0, data.1, FieldOrder::Proto, 25, 25).unwrap();
+
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        for c in "5000000000".chars() { // greater than u32::MAX
+            app.run_command(KeyPress(c)).unwrap();
+        }
+        // the minus is not accepted by an unsigned type at all
+        app.run_command(KeyPress('-')).unwrap();
+
+        // Esc cannot commit the value: the editor stays open showing the error
+        app.run_command(UserCommand::Exit).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [
+            " f1: 5000000000   uint32 ",
+            "cursor: 15,1"]);
+        assert!(app.layouts.items[0].get_status_string(1, 0).contains("uint32"));
+        match &app.data.get_field(&[(1, 0).into()]).unwrap().value {
+            SCALAR(U32(value)) => assert_eq!(*value, 7), // data not changed
+            _ => panic!("f1 is not an uint32"),
+        }
+
+        // deleting all text and Esc reverts the edit
+        for _ in 0..10 { app.run_command(DeleteData(true)).unwrap(); }
+        app.run_command(UserCommand::Exit).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [" f1: 7            uint32 "]);
+    }
+
+    #[test]
+    fn type_float_value() {
+        let data = make_one_field_data("message M { float f1=1; }", F32(1.5));
+        let mut app = App::for_tests(data.0, data.1, FieldOrder::Proto, 25, 25).unwrap();
+        assert_eq!(app.to_strings(), [" f1: 1.5           float "]);
+
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        for c in "2.25".chars() {
+            app.run_command(KeyPress(c)).unwrap();
+        }
+        app.run_command(UserCommand::Exit).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [" f1: 2.25          float "]);
+        match &app.data.get_field(&[(1, 0).into()]).unwrap().value {
+            SCALAR(F32(value)) => assert_eq!(*value, 2.25),
+            _ => panic!("f1 is not a float"),
+        }
+    }
+
+    #[test]
+    fn type_bool_value() {
+        let data = make_one_field_data("message M { bool f1=1; }", BOOL(false));
+        let mut app = App::for_tests(data.0, data.1, FieldOrder::Proto, 25, 25).unwrap();
+        assert_eq!(app.to_strings(), [" f1: false          bool "]);
+
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        for c in "true".chars() {
+            app.run_command(KeyPress(c)).unwrap();
+        }
+        app.run_command(UserCommand::Exit).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [" f1: true           bool "]);
+        match &app.data.get_field(&[(1, 0).into()]).unwrap().value {
+            SCALAR(BOOL(value)) => assert_eq!(*value, true),
+            _ => panic!("f1 is not a bool"),
+        }
+    }
+
+    #[test]
+    fn edit_second_value_of_repeated_int32() {
+        let binary_input = [0x08, 5, 0x08, 7];
+        let proto = ProtoData::new("message M { repeated int32 f1=1; }").unwrap().finalize().unwrap();
+        let mut limit = binary_input.len() as u32;
+        let root_msg = proto.auto_detect_root_message().unwrap();
+        let mut read = PbReader::new(binary_input.as_slice());
+        let data = MessageData::new(&mut read, &proto, root_msg, &mut limit).unwrap();
+        let mut app = App::for_tests(data, proto, FieldOrder::Proto, 25, 25).unwrap();
+        assert_eq!(app.to_strings(), [" f1: 5 7          int32* "]);
+
+        // the cursor on the second value: the editor opens for it
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        app.run_command(KeyPress('9')).unwrap();
+        assert_eq!(app.to_strings(), [
+            " f1: 5 9          int32* ",
+            "cursor: 8,1"]);
+
+        app.run_command(UserCommand::Exit).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [" f1: 5 9          int32* "]);
+        match &app.data.get_field(&[(1, 1).into()]).unwrap().value {
+            SCALAR(I32(value)) => assert_eq!(*value, 9),
+            _ => panic!("f1[1] is not an int32"),
+        }
+    }
+
+    // two repeated int32 fields: f1 has three short values, f2 one long value
+    fn make_two_repeated_fields_data() -> (MessageData, ProtoData) {
+        let binary_input = [
+            0x08, 1, 0x08, 2, 0x08, 3,
+            0x10, 0xC0, 0xC4, 0x07]; // 123456
+        let proto = ProtoData::new("message M { repeated int32 f1=1; repeated int32 f2=2; }").unwrap().finalize().unwrap();
+        let mut limit = binary_input.len() as u32;
+        let root_msg = proto.auto_detect_root_message().unwrap();
+        let mut read = PbReader::new(binary_input.as_slice());
+        let data = MessageData::new(&mut read, &proto, root_msg, &mut limit).unwrap();
+        (data, proto)
+    }
+
+    #[test]
+    fn arrow_down_keeps_column_between_scalar_fields() {
+        let data = make_two_repeated_fields_data();
+        let mut app = App::for_tests(data.0, data.1, FieldOrder::Proto, 25, 25).unwrap();
+        assert_eq!(app.to_strings(), [
+            " f1: 1 2 3        int32* ",
+            " f2: 123456       int32* "]);
+
+        // select the second value of f1
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        assert_eq!((app.selected.layout, app.selected.x, app.selected.y), (0, 2, 0));
+
+        // arrow down: the value of f2 under the same screen column gets selected
+        app.run_command(ScrollVertically(1)).unwrap();
+        app.after_event().unwrap();
+        assert_eq!((app.selected.layout, app.selected.x, app.selected.y), (1, 1, 0));
+        // only a selection, no editor was opened (no cursor line, data intact)
+        assert_eq!(app.to_strings(), [
+            " f1: 1 2 3        int32* ",
+            " f2: 123456       int32* "]);
+    }
+
+    #[test]
+    fn arrow_down_from_last_value_selects_long_value_below() {
+        let data = make_two_repeated_fields_data();
+        let mut app = App::for_tests(data.0, data.1, FieldOrder::Proto, 25, 25).unwrap();
+
+        // select the last (third) value of f1
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        assert_eq!((app.selected.layout, app.selected.x, app.selected.y), (0, 3, 0));
+
+        // arrow down: the long value of f2 spans this column too
+        app.run_command(ScrollVertically(1)).unwrap();
+        app.after_event().unwrap();
+        assert_eq!((app.selected.layout, app.selected.x, app.selected.y), (1, 1, 0));
+
+        // arrow up: vim-style sticky column, the passage through the long value
+        // did not lose the target column, the round trip returns to the third value
+        app.run_command(ScrollVertically(-1)).unwrap();
+        app.after_event().unwrap();
+        assert_eq!((app.selected.layout, app.selected.x, app.selected.y), (0, 3, 0));
+    }
+
+    #[test]
+    fn sticky_column_survives_clamp_on_short_line() {
+        let binary_input = [
+            0x08, 1, 0x08, 2, 0x08, 3,             // f1: 1 2 3
+            0x10, 7,                               // f2: 7
+            0x18, 11, 0x18, 22, 0x18, 33];         // f3: 11 22 33
+        let proto = ProtoData::new("message M { repeated int32 f1=1; repeated int32 f2=2; repeated int32 f3=3; }").unwrap().finalize().unwrap();
+        let mut limit = binary_input.len() as u32;
+        let root_msg = proto.auto_detect_root_message().unwrap();
+        let mut read = PbReader::new(binary_input.as_slice());
+        let data = MessageData::new(&mut read, &proto, root_msg, &mut limit).unwrap();
+        let mut app = App::for_tests(data, proto, FieldOrder::Proto, 25, 25).unwrap();
+        assert_eq!(app.to_strings(), [
+            " f1: 1 2 3        int32* ",
+            " f2: 7            int32* ",
+            " f3: 11 22 33     int32* "]);
+
+        // select the third value of f1 (column 4)
+        for _ in 0..3 { app.run_command(ScrollHorizontally(1)).unwrap(); }
+        assert_eq!((app.selected.layout, app.selected.x, app.selected.y), (0, 3, 0));
+
+        // down: the shorter f2 line clamps the selection to its only value
+        app.run_command(ScrollVertically(1)).unwrap();
+        app.after_event().unwrap();
+        assert_eq!((app.selected.layout, app.selected.x, app.selected.y), (1, 1, 0));
+
+        // down again: the clamp did not lose the target column 4,
+        // it selects '22' of f3 (columns 3..5), not the first value
+        app.run_command(ScrollVertically(1)).unwrap();
+        app.after_event().unwrap();
+        assert_eq!((app.selected.layout, app.selected.x, app.selected.y), (2, 2, 0));
+
+        // moving to the name column resets the column memory: going down
+        // travels along the names now
+        for _ in 0..2 { app.run_command(ScrollHorizontally(-1)).unwrap(); }
+        assert_eq!(app.selected.x, 0);
+        app.run_command(ScrollVertically(-1)).unwrap();
+        app.after_event().unwrap();
+        assert_eq!((app.selected.layout, app.selected.x, app.selected.y), (1, 0, 0));
+    }
+
+    #[test]
+    fn column_selection_restored_after_passing_structure_name() {
+        let binary_input = [
+            0x08, 1, 0x08, 2, 0x08, 3, // f1: 1 2 3
+            0x12, 0x02, 0x48, 9];      // m2 { f9: 9 }
+        let proto_str = r#"
+message M { repeated int32 f1=1; M2 m2=2; }
+message M2 { int32 f9=9; }
+"#;
+        let proto = ProtoData::new(proto_str).unwrap().finalize().unwrap();
+        let mut limit = binary_input.len() as u32;
+        let root_msg = proto.auto_detect_root_message().unwrap();
+        let mut read = PbReader::new(binary_input.as_slice());
+        let data = MessageData::new(&mut read, &proto, root_msg, &mut limit).unwrap();
+        let mut app = App::for_tests(data, proto, FieldOrder::Proto, 25, 25).unwrap();
+
+        // select the second value of f1
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        assert_eq!((app.selected.layout, app.selected.x, app.selected.y), (0, 2, 0));
+
+        // arrow down: the next item has no data columns, its name gets selected
+        app.run_command(ScrollVertically(1)).unwrap();
+        app.after_event().unwrap();
+        assert_eq!((app.selected.layout, app.selected.x, app.selected.y), (1, 0, 0));
+
+        // arrow up: the column is remembered, the same value of f1 is selected again
+        app.run_command(ScrollVertically(-1)).unwrap();
+        app.after_event().unwrap();
+        assert_eq!((app.selected.layout, app.selected.x, app.selected.y), (0, 2, 0));
+
+        // down through the structure name to the f9 line: the column still applies,
+        // the shorter line selects its last (only) value
+        app.run_command(ScrollVertically(1)).unwrap();
+        app.run_command(ScrollVertically(1)).unwrap();
+        app.after_event().unwrap();
+        assert_eq!((app.selected.layout, app.selected.x, app.selected.y), (2, 1, 0));
+    }
+
+    #[test]
+    fn focus_loss_commits_number_editor() {
+        let binary_input = [0x08, 1, 0x10, 2];
+        let proto = ProtoData::new("message M { int32 f1=1; int32 f2=2; }").unwrap().finalize().unwrap();
+        let mut limit = binary_input.len() as u32;
+        let root_msg = proto.auto_detect_root_message().unwrap();
+        let mut read = PbReader::new(binary_input.as_slice());
+        let data = MessageData::new(&mut read, &proto, root_msg, &mut limit).unwrap();
+        let mut app = App::for_tests(data, proto, FieldOrder::Proto, 25, 25).unwrap();
+
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        app.run_command(KeyPress('5')).unwrap();
+        // arrow down: the editor loses focus and commits the typed value
+        app.run_command(ScrollVertically(1)).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [
+            " f1: 5             int32 ",
+            " f2: 2             int32 "]);
+        match &app.data.get_field(&[(1, 0).into()]).unwrap().value {
+            SCALAR(I32(value)) => assert_eq!(*value, 5),
+            _ => panic!("f1 is not an int32"),
+        }
+    }
+
+    #[test]
+    fn edit_absent_int32_inserts_field() {
+        let data = make_no_field_data("message M { int32 f1=1; }");
+        let mut app = App::for_tests(data.0, data.1, FieldOrder::Proto, 25, 25).unwrap();
+        assert_eq!(app.to_strings(), [" f1: 0            -int32 "]);
+        assert!(app.data.get_field(&[(1, 0).into()]).is_none());
+
+        // the shown default value can be selected and edited, committing inserts the field
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        app.run_command(KeyPress('4')).unwrap();
+        app.run_command(KeyPress('2')).unwrap();
+        app.run_command(UserCommand::Exit).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [" f1: 42            int32 "]);
+        match &app.data.get_field(&[(1, 0).into()]).unwrap().value {
+            SCALAR(I32(value)) => assert_eq!(*value, 42),
+            _ => panic!("f1 is not an int32"),
+        }
+    }
 
     // TODO unknown field layout
     // TODO delete a field of a submessage
