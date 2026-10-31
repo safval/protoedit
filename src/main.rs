@@ -38,6 +38,7 @@ use crate::proto::{FieldProtoPtr, MessageProto, ProtoData, ProtoFile};
 use crate::typedefs::{PbReader};
 use crate::view::FieldOrder::Proto;
 use crate::popup::{Popup, PopupItem};
+use crate::trz::{Change, ChangeType};
 use crate::view::UserCommand::{ChangeFieldOrder, CollapsedToggle, DeleteData, End, Home, InsertData, ScrollHorizontally, ScrollSibling, ScrollToBottom, ScrollVertically, SelectHorizontally, SelectVertically, SelectHome, SelectEnd, AddCursor, Undo, Redo, Exit, KeyPress};
 use crate::wire::FieldValue::SCALAR;
 
@@ -377,6 +378,14 @@ impl App {
                 Ok(false)
             }
             CommandResult::ChangeData(mut change) => {
+                // inserting a member of a oneof deletes the member set before
+                if let ChangeType::Insert(_) = &change.action {
+                    let deleted = self.data.oneof_members_set(&change.path);
+                    if !deleted.is_empty() {
+                        let ChangeType::Insert(value) = change.action else { unreachable!() };
+                        change = Change::oneof_switch(deleted, change.path, value);
+                    }
+                }
                 self.data.apply(&mut change);
                 self.layouts.update_after_data_changed(&self.data, &self.layout_config, self.selected.layout);
                 self.need_update_layout_height = true;
@@ -395,6 +404,24 @@ impl App {
                     PopupItem::new("Discard", CommandResult::Quit),
                     PopupItem::new("Cancel", CommandResult::None),
                 ]));
+                self.need_update = true;
+                Ok(false)
+            }
+            CommandResult::SetOneofMember(path) => {
+                let Some(def) = self.data.get_field_definition(&path) else { return Ok(false) };
+                let set = self.data.get_field(&path.0).is_some();
+                if !set {
+                    self.after_command(CommandResult::ChangeData(Change { path: path.clone(), action: ChangeType::Insert(def.default()) }))?;
+                }
+                // the cursor goes to the member: on the value of a new scalar to type it at once
+                if let Some(index) = self.layouts.items.iter().position(|item| item.path.0 == path.0) {
+                    self.selected = Selection { layout: index, ..Selection::default() };
+                    if set {
+                        self.layouts.toggle_collapsed(&self.data, &self.layout_config, index);
+                    } else if !def.is_message() {
+                        self.run_command(ScrollHorizontally(1))?;
+                    }
+                }
                 self.need_update = true;
                 Ok(false)
             }
@@ -3098,6 +3125,141 @@ message M2 { int32 f9=9; }
         ]);
         assert!(!app.run_command(CollapsedToggle).unwrap());
         assert!(app.popup.is_none());
+    }
+
+    const ONEOF_PROTO: &str = "enum Color { RED=0; GREEN=1; }\nmessage M { oneof kind { int32 number=1; Color color=2; } }";
+
+    #[test]
+    fn editing_oneof_member_deletes_the_set_one() {
+        let data = make_one_field_data(ONEOF_PROTO, I32(5));
+        let mut app = App::for_tests(data.0, data.1, FieldOrder::Proto, 30, 7).unwrap();
+        assert_eq!(app.to_strings(), [
+            " number: 5              int32 ",
+            "  color: RED           -Color ",
+        ]);
+
+        // choosing a value of the absent member replaces the set one
+        app.run_command(ScrollVertically(1)).unwrap();
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        app.run_command(CollapsedToggle).unwrap();
+        app.run_command(ScrollVertically(1)).unwrap();
+        app.run_command(CollapsedToggle).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [
+            " number: 0             -int32 ",
+            "  color: GREEN          Color ",
+        ]);
+        assert!(app.data.get_field(&[(1, 0).into()]).is_none());
+
+        // and back by typing a number
+        app.run_command(ScrollVertically(-1)).unwrap();
+        app.run_command(KeyPress('8')).unwrap();
+        app.run_command(UserCommand::Exit).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [
+            " number: 8              int32 ",
+            "  color: RED           -Color ",
+        ]);
+        assert!(app.data.get_field(&[(2, 0).into()]).is_none());
+    }
+
+    // text of the screen chars shown with the style
+    fn styled_text(app: &mut App, style: TextStyle) -> String {
+        let (lines, _) = app.compose();
+        lines.iter().flat_map(|line| line.0.iter()).filter(|v| v.1 == style).map(|v| v.0).collect()
+    }
+
+    #[test]
+    fn oneof_member_chosen_from_list() {
+        let proto = "enum Color { RED=0; GREEN=1; }\nmessage P { int32 x=1; }\nmessage M { oneof kind { int32 number=1; Color color=2; string text=3; P point=4; } }";
+        let data = make_one_field_data(proto, I32(5));
+        let mut app = App::for_tests(data.0, data.1, FieldOrder::Proto, 30, 9).unwrap();
+
+        // Enter on the name of any member lists the members, the set one selected
+        app.run_command(ScrollVertically(2)).unwrap();
+        app.run_command(CollapsedToggle).unwrap();
+        assert_eq!(app.to_strings(), [
+            " number: 5              int32 ",
+            "  color: RED           -Color ",
+            "   text: ''           -string ",
+            "  point┌─ kind ─────────┐  -P ",
+            "       │ number  int32  │     ",
+            "       │ color   Color  │     ",
+            "       │ text    string ▼     ",
+            "       └────────────────┘     ",
+        ]);
+        assert_eq!(popup_selection(&mut app), " number  int32  ");
+
+        // choosing the set member changes nothing
+        app.run_command(CollapsedToggle).unwrap();
+        app.after_event().unwrap();
+        assert!(!app.modified);
+
+        // choosing another member sets it, the cursor on its value
+        app.run_command(CollapsedToggle).unwrap();
+        app.run_command(ScrollVertically(1)).unwrap();
+        app.run_command(CollapsedToggle).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [
+            " number: 0             -int32 ",
+            "  color: RED            Color ",
+            "   text: ''           -string ",
+            "  point:                   -P ",
+        ]);
+        assert_eq!(styled_text(&mut app, TextStyle::SelectedValue), "RED");
+
+        // a string member opens its editor to type the value at once
+        app.run_command(UserCommand::Home).unwrap(); // the name column
+        app.run_command(CollapsedToggle).unwrap();
+        app.run_command(ScrollVertically(1)).unwrap();
+        app.run_command(CollapsedToggle).unwrap();
+        app.after_event().unwrap();
+        app.run_command(KeyPress('z')).unwrap();
+        app.run_command(UserCommand::Exit).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [
+            " number: 0             -int32 ",
+            "  color: RED           -Color ",
+            "   text: 'z'           string ",
+            "  point:                   -P ",
+        ]);
+
+        // a message member gets its name selected
+        app.run_command(CollapsedToggle).unwrap();
+        app.run_command(ScrollVertically(1)).unwrap();
+        app.run_command(CollapsedToggle).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [
+            " number: 0             -int32 ",
+            "  color: RED           -Color ",
+            "   text: ''           -string ",
+            "  point:                    P ",
+            "        x: 0           -int32 ",
+        ]);
+        assert_eq!(styled_text(&mut app, TextStyle::SelectedFieldName), " point:");
+
+        // choosing the set message again collapses it, and once more expands it
+        app.run_command(CollapsedToggle).unwrap();
+        assert_eq!(popup_selection(&mut app), " point   P      ");
+        app.run_command(CollapsedToggle).unwrap();
+        app.after_event().unwrap();
+        // the minus marks absent members only, the set empty message has none
+        assert_eq!(app.to_strings(), [
+            " number: 0             -int32 ",
+            "  color: RED           -Color ",
+            "   text: ''           -string ",
+            "  point: ... 0              P ",
+        ]);
+        app.run_command(CollapsedToggle).unwrap();
+        app.run_command(CollapsedToggle).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [
+            " number: 0             -int32 ",
+            "  color: RED           -Color ",
+            "   text: ''           -string ",
+            "  point:                    P ",
+            "        x: 0           -int32 ",
+        ]);
     }
 
     // TODO unknown field layout

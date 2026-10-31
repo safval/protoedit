@@ -627,8 +627,44 @@ impl<'proto> MessageData {
             ChangeType::Delete => {
                 change.action = ChangeType::Insert(self.delete_field(&change.path.0)?)
             }
+
+            ChangeType::Batch(changes) => {
+                for i in 0..changes.len() {
+                    if self.apply(&mut changes[i]).is_none() {
+                        // roll back the applied part, so the data stays as it was
+                        for change in changes[..i].iter_mut().rev() {
+                            self.apply(change);
+                        }
+                        return None;
+                    }
+                }
+                // each change turned into its inverse, in reverse order they undo the batch
+                changes.reverse();
+            }
         }
         Some(())
+    }
+
+    // paths of the set members of the oneof the field belongs to, except the field
+    // itself; a valid message has at most one, but a file may contain more
+    pub fn oneof_members_set(&self, path: &FieldPath) -> Vec<FieldPath> {
+        let Some((last, parent_path)) = path.0.split_last() else { return vec![] };
+        let Some(parent) = self.get_submessage(parent_path) else { return vec![] };
+        let Some(def) = parent.def.get_field(last.id) else { return vec![] };
+        let Some(oneof) = def.oneof_name() else { return vec![] };
+
+        let mut res = vec![];
+        let mut indexes = HashMap::<i32, usize>::new();
+        for field in &parent.fields {
+            if field.id() != last.id && field.def.oneof_name().as_ref() == Some(oneof) {
+                let index = indexes.entry(field.id()).or_default();
+                res.push(FieldPath(parent_path.to_vec()).add(FieldPos { id: field.id(), index: *index }));
+                *index += 1;
+            }
+        }
+        // later values of a duplicated field go first: deleting them keeps the indexes valid
+        res.reverse();
+        res
     }
 
     // result may be inaccurate in case of a packed field (todo)
@@ -872,8 +908,9 @@ mod read_message {
     use crate::proto::ProtoData;
     use crate::typedefs::PbReader;
     use crate::view::FieldOrder;
-    use crate::wire::{FieldPos, FieldValue, MessageData};
+    use crate::wire::{FieldPos, FieldValue, MessageData, ScalarValue};
     use crate::wire::ScalarValue::{I32, SF32, STR};
+    use crate::trz::Change;
 
     fn all_scalar_proto() -> &'static str {
         r#"
@@ -1429,6 +1466,61 @@ message House {
         let data = MessageData::new(&mut read, &proto, root_msg, &mut limit).unwrap();
         // msg contains all the data read, but only the last value will be used
         assert_eq!("message TestMessage {\n  length = 1\n  name = abc\n  number = 100\n}\n", data.to_string());
+    }
+
+    fn read_oneof_data(binary_input: &[u8]) -> MessageData {
+        let proto_str = "message TestMessage { float length = 100; oneof test_oneof { string name = 101; int32 number = 102; bool flag = 103; }}";
+        let proto = ProtoData::new(proto_str).unwrap().finalize().unwrap();
+        let mut limit = binary_input.len() as u32;
+        let root_msg = proto.auto_detect_root_message().unwrap();
+        let mut read = PbReader::new(binary_input);
+        MessageData::new(&mut read, &proto, root_msg, &mut limit).unwrap()
+    }
+
+    #[test]
+    fn oneof_members_set() {
+        let data = read_oneof_data(&[
+            0xA5, 0x06, 0x00, 0x00, 0x80, 0x3F, // float#100 = 1.0;
+            0xAA, 0x06, 0x01, 0x61,             // string#101 = "a";
+            0xB0, 0x06, 0x01,                   // int32#102 = 1
+            0xAA, 0x06, 0x01, 0x62]);           // string#101 = "b"; (an invalid file)
+        // the later values go first
+        let paths: Vec<Vec<FieldPos>> = data.oneof_members_set(&[(103, 0)].into()).into_iter().map(|p| p.0).collect();
+        assert_eq!(paths, [vec![(101, 1).into()], vec![(102, 0).into()], vec![(101, 0).into()]]);
+        // the field itself is not counted, a field out of any oneof has no members
+        let paths: Vec<Vec<FieldPos>> = data.oneof_members_set(&[(102, 0)].into()).into_iter().map(|p| p.0).collect();
+        assert_eq!(paths, [vec![(101, 1).into()], vec![(101, 0).into()]]);
+        assert!(data.oneof_members_set(&[(100, 0)].into()).is_empty());
+    }
+
+    #[test]
+    fn batch_change_and_its_inverse() {
+        let mut data = read_oneof_data(&[
+            0xA5, 0x06, 0x00, 0x00, 0x80, 0x3F,  // float#100 = 1.0;
+            0xAA, 0x06, 0x03, 0x61, 0x62, 0x63]); // string#101 = "abc";
+        let original = data.to_string();
+
+        let deleted = data.oneof_members_set(&[(102, 0)].into());
+        let mut change = Change::oneof_switch(deleted, [(102, 0)].into(), FieldValue::SCALAR(ScalarValue::I32(7)));
+        assert!(data.apply(&mut change).is_some());
+        assert_eq!("message TestMessage {\n  length = 1\n  number = 7\n}\n", data.to_string());
+
+        // the applied batch turned into its inverse
+        assert!(data.apply(&mut change).is_some());
+        assert_eq!(original, data.to_string());
+    }
+
+    #[test]
+    fn failed_batch_rolled_back() {
+        let mut data = read_oneof_data(&[
+            0xA5, 0x06, 0x00, 0x00, 0x80, 0x3F,  // float#100 = 1.0;
+            0xAA, 0x06, 0x03, 0x61, 0x62, 0x63]); // string#101 = "abc";
+        let original = data.to_string();
+
+        // the second change deletes a field that does not exist
+        let mut change = Change::oneof_switch(vec![[(101, 0)].into(), [(102, 0)].into()], [(103, 0)].into(), FieldValue::SCALAR(ScalarValue::BOOL(true)));
+        assert!(data.apply(&mut change).is_none());
+        assert_eq!(original, data.to_string());
     }
 
     #[test]

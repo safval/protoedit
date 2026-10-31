@@ -103,6 +103,9 @@ pub enum CommandResult {
     Redraw,
     ChangeData(Change),
     ShowPopup(Popup), // open the upper UI layer: a message or a list to choose from
+    // select the oneof member: an absent one is inserted (the set one is deleted),
+    // a set message is collapsed or expanded
+    SetOneofMember(FieldPath),
     StartEdit(FieldPath, u16, u16),
     Exit, // close the application, asks to save the changes if any
     Quit, // close the application without questions
@@ -1635,7 +1638,7 @@ impl ViewLayout for CollapsedLayout {
         if let Some(field_def) = root.get_field_definition(path) {
             line.add_field_name(field_def.name().clone(), indent, &cursor);
             line.add_field_size(self.display_size, width);
-            line.add_typename(field_def.clone(), width, self.display_size == 0);
+            line.add_typename(field_def.clone(), width, amount == 0);
         }
 
 
@@ -2265,40 +2268,14 @@ impl Layouts {
                 }
             }
 
-            UserCommand::CollapsedToggle => {
-                let layout_type = self.items.get(selection.layout)
-                    .and_then(|current| current.layout.as_ref())
-                    .map(|layout| layout.layout_type());
-                match layout_type {
-                    Some(LayoutType::Message) => {
-                        let current = &self.items[selection.layout];
-                        let current_path = current.path.clone();
-                        let current_amount = current.amount;
-                        // there is no reason to collapse a message that does not exist, it's already displayed in one line
-                        if let Some(msg) = root.get_submessage(&current_path.0) {
-                            // remove selected layout and all nested layouts
-                            let path_len = current_path.0.len();
-                            let mut end_pos = selection.layout + 1;
-                            while end_pos < self.items.len() {
-                                let len = self.items[end_pos].path.0.len();
-                                if len <= path_len { break; }
-                                end_pos += 1;
-                            }
-                            self.items.drain(selection.layout + 1..end_pos);
-                            // create a collapsed layout in place of the deleted
-                            self.items[selection.layout] = LayoutParams::new(current_path, current_amount, Box::new(CollapsedLayout { display_size: msg.len() }));
-                        }
-                        CommandResult::Redraw
-                    }
-                    Some(LayoutType::Collapsed) => {
-                        self.expand_collapsed(root, config, selection.layout);
-                        CommandResult::Redraw
-                    }
-                    // other layouts may consume Enter themselves (e.g. new line in a string editor)
-                    Some(_) => self.run_active_layout_command(command, root, config, selection),
-                    None => CommandResult::Redraw,
-                }
-            }
+            UserCommand::CollapsedToggle => if let Some(popup) = self.oneof_popup(root, selection) {
+                CommandResult::ShowPopup(popup)
+            } else if self.toggle_collapsed(root, config, selection.layout) {
+                CommandResult::Redraw
+            } else if self.items.get(selection.layout).is_some_and(|item| item.layout.is_some()) {
+                // other layouts may consume Enter themselves (e.g. new line in a string editor)
+                self.run_active_layout_command(command, root, config, selection)
+            } else { CommandResult::Redraw }
             _ => self.run_active_layout_command(command, root, config, selection)
         };
 
@@ -2311,6 +2288,68 @@ impl Layouts {
             selection.preferred_column = self.items.get(selection.layout).and_then(|item| item.get_preferred_column(selection.x, selection.y));
         }
         result
+    }
+
+    // collapse the message layout or expand the collapsed one;
+    // false if the layout is neither of them
+    pub fn toggle_collapsed(&mut self, root: &MessageData, config: &LayoutConfig, index: usize) -> bool {
+        let layout_type = self.items.get(index)
+            .and_then(|current| current.layout.as_ref())
+            .map(|layout| layout.layout_type());
+        match layout_type {
+            Some(LayoutType::Message) => {
+                let current = &self.items[index];
+                let current_path = current.path.clone();
+                let current_amount = current.amount;
+                // there is no reason to collapse a message that does not exist, it's already displayed in one line
+                if let Some(msg) = root.get_submessage(&current_path.0) {
+                    // remove selected layout and all nested layouts
+                    let path_len = current_path.0.len();
+                    let mut end_pos = index + 1;
+                    while end_pos < self.items.len() {
+                        let len = self.items[end_pos].path.0.len();
+                        if len <= path_len { break; }
+                        end_pos += 1;
+                    }
+                    self.items.drain(index + 1..end_pos);
+                    // create a collapsed layout in place of the deleted
+                    self.items[index] = LayoutParams::new(current_path, current_amount, Box::new(CollapsedLayout { display_size: msg.len() }));
+                }
+                true
+            }
+            Some(LayoutType::Collapsed) => {
+                self.expand_collapsed(root, config, index);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    // Enter on the name of a oneof member: the list of the oneof members to set one of them
+    fn oneof_popup(&self, root: &MessageData, selection: &Selection) -> Option<Popup> {
+        if selection.x != 0 || selection.y != 0 { return None }
+        let current = self.items.get(selection.layout)?;
+        if current.get_text_edit_cursor().is_some() { return None }
+        let def = root.get_field_definition(&current.path)?;
+        let oneof = def.oneof_name().as_ref()?;
+        let (_, parent_path) = current.path.0.split_last()?;
+        let parent = root.get_submessage(parent_path)?;
+
+        let members: Vec<&FieldProtoPtr> = parent.def.fields.iter().filter(|f| f.oneof_name().as_ref() == Some(oneof)).collect();
+        let name_width = members.iter().map(|m| m.name().len()).max().unwrap_or(0);
+        let mut items = vec![];
+        let mut selected = None;
+        for (i, member) in members.iter().enumerate() {
+            let path = FieldPath(parent_path.to_vec()).add(FieldPos { id: member.id(), index: 0 });
+            let action =
+                if root.get_field(&path.0).is_some() {
+                    selected.get_or_insert(i);
+                    // a set scalar stays as it is, a set message is collapsed or expanded
+                    if member.is_message() { CommandResult::SetOneofMember(path) } else { CommandResult::None }
+                } else { CommandResult::SetOneofMember(path) };
+            items.push(PopupItem::new(&format!("{:<name_width$}  {}", member.name(), member.typename()), action));
+        }
+        Some(Popup::list(oneof, items, selected.unwrap_or(0), Some((0, 0))))
     }
 
     pub fn scroll_sibling(&self, delta: i8, selection: &mut Selection) -> bool {

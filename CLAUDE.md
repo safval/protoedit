@@ -30,7 +30,7 @@ A single positional argument, semicolon-separated: `data.pb;format.proto;message
 - `-I`/`--proto_path <dir>` adds directories for resolving `import`ed proto files (must be absolute paths).
 - `-d`/`--delimited` reads the data file as a stream of length-delimited records (varint length prefix before each message, the `writeDelimitedTo`/`pb_encode_delimited` framing). The records become a repeated field of a hidden wrapper message synthesized by `ProtoData::make_delimited_wrapper`; `MessageData::new_delimited`/`write_delimited` handle the framing, and `Layouts.delimited` makes saving write the prefixes back.
 
-`resources/` holds example `.pb`/`.proto` pairs (`ints`, `str`, `bytes`, `enum`, `mega`, `test_data_1`) for manual testing.
+`resources/` holds example `.pb`/`.proto` pairs (`ints`, `str`, `bytes`, `enum`, `oneof`, `mega`, `test_data_1`) for manual testing.
 
 ## Architecture
 
@@ -50,7 +50,7 @@ Two parallel data models flow through the program and must be kept consistent wi
 | `view.rs` | Presentation: `Layouts`, the `ViewLayout` trait + implementations, `UserCommand`, `CommandResult`, `FieldOrder`, `LayoutConfig`, `TextStyle`. |
 | `trz.rs` | Mutation records (`Change`, `ChangeType`, `History`) used for editing and undo. |
 | `text_edit.rs` | In-place text/string editing helpers (`TextEditor`, `TextLines`). |
-| `popup.rs` | The upper UI layer drawn over the layouts: `Popup` (message box with buttons, or a scrollable list such as enum values). Each `PopupItem` carries the `CommandResult` the `App` runs when it is chosen. While `App.popup` is open, `App::run_command` routes all commands to it. |
+| `popup.rs` | The upper UI layer drawn over the layouts: `Popup` (message box with buttons, or a scrollable list: enum values, or the members of a oneof on Enter at a member's name). Each `PopupItem` carries the `CommandResult` the `App` runs when it is chosen. While `App.popup` is open, `App::run_command` routes all commands to it. |
 | `pb.pest` | PEG grammar (pest) for the `.proto` subset that is supported. |
 
 ### Critical invariants
@@ -66,6 +66,7 @@ Two parallel data models flow through the program and must be kept consistent wi
 2. `App::run_command` → `Layouts::run_command`, which usually delegates to the selected layout's `ViewLayout::on_command`.
 3. The result is a `CommandResult`. `CommandResult::ChangeData(Change)` is applied via `MessageData::apply(&mut Change)`.
 4. `MessageData::apply` performs the edit **and rewrites the `Change` into its inverse** (e.g. `Insert` becomes `Delete`), which is the basis for undo/redo (`trz.rs`).
+   `ChangeType::Batch` applies several changes in order (rolled back if one fails) and is reversed into its inverse. `App::after_command` turns an `Insert` of a oneof member into a `Batch` that first deletes the members already set (`MessageData::oneof_members_set`), so every editor keeps a oneof valid.
 5. Navigation into the data tree uses `FieldPath` — a `Vec<FieldPos { id, index }>` where `index > 0` selects among repeated fields.
 6. Saving (F2) calls `Layouts::save_document`, which writes to a `.tmp` file and atomically renames it over the original.
 

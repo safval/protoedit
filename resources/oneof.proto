@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+// Oneof fields for manual testing: setting an absent member of a oneof
+// (typing a value, choosing an enum value, Insert) deletes the member set before
+
+enum Shape {
+  CIRCLE = 0;
+  SQUARE = 1;
+  TRIANGLE = 2;
+}
+
+message Point {
+  int32 x = 1;
+  int32 y = 2;
+}
+
+message Inner {
+  oneof value {
+    // 5 in the data
+    int32 number = 1;
+    Shape shape = 2;
+  }
+}
+
+message Example {
+  // 42 in the data, not a member of a oneof: editing it deletes nothing
+  int32 id = 1;
+  oneof kind {
+    // 'abc' in the data
+    string name = 2;
+    int32 number = 3;
+    Shape shape = 4;
+  }
+  // a oneof of a nested message
+  Inner inner = 5;
+  oneof target {
+    // nothing set in the data: setting a member deletes nothing
+    Point point = 6;
+    int32 index = 7;
+  }
+  oneof broken {
+    // an invalid file: first and second are both set,
+    // setting third deletes both
+    int32 first = 8;
+    int32 second = 9;
+    int32 third = 10;
+  }
+}
