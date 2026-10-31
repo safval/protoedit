@@ -6,6 +6,7 @@ mod typedefs;
 mod view;
 mod trz;
 mod text_edit;
+mod popup;
 
 use std::string::String;
 use crate::ScalarValue::STR;
@@ -36,6 +37,7 @@ use pest::Lines;
 use crate::proto::{FieldProtoPtr, MessageProto, ProtoData, ProtoFile};
 use crate::typedefs::{PbReader};
 use crate::view::FieldOrder::Proto;
+use crate::popup::{Popup, PopupItem};
 use crate::view::UserCommand::{ChangeFieldOrder, CollapsedToggle, DeleteData, End, Home, InsertData, ScrollHorizontally, ScrollSibling, ScrollToBottom, ScrollVertically, SelectHorizontally, SelectVertically, SelectHome, SelectEnd, AddCursor, Undo, Redo, Exit, KeyPress};
 use crate::wire::FieldValue::SCALAR;
 
@@ -51,9 +53,6 @@ struct RepeatedEditorConfig {
     vertical: bool, // field names in the left column
     columns: u16, // 0 to autofill all available space
 }
-
-// UpperUilayer: confirmations (CtrlC exit,etc.), enum/oneof lists
-
 
 #[derive(Default)]
 struct Selection {
@@ -92,6 +91,11 @@ struct App {
     pub selected: Selection,
     pub need_update: bool,
     pub need_update_layout_height: bool,
+    // the data was changed after it was read or saved
+    pub modified: bool,
+    // the upper UI layer over the layouts (see popup.rs): while it is open it
+    // takes all user commands
+    pub popup: Option<Popup>,
 }
 
 impl App {
@@ -126,6 +130,8 @@ impl App {
             need_update: true,
             need_update_layout_height: true,
             test_mode: false,
+            modified: false,
+            popup: None,
         };
         app.update()?;
         Ok(app)
@@ -150,6 +156,8 @@ impl App {
             need_update: true,
             need_update_layout_height: true,
             test_mode: true,
+            modified: false,
+            popup: None,
         };
         app.to_strings();
         Ok(app)
@@ -220,12 +228,11 @@ impl App {
 
         let quit_app =
             match event.code {
+                KeyCode::F(_) if self.popup.is_some() => false,
                 KeyCode::F(n) => match n {
                     2 => {
-                        // stop opened editors if any,
-                        // if edit incomplete it will be discarded to show user what written in the file
-                        self.run_command(Exit)?;
-                        self.layouts.save_document(&self.data)?
+                        self.close_editors()?;
+                        self.after_command(CommandResult::Save { quit: false })?
                     }
                     3 => {
                         // TODO change self.layout_config.format; no renderer reads it yet
@@ -244,7 +251,10 @@ impl App {
                         self.need_update_layout_height = true;
                         false
                     }
-                    10 => self.run_command(Exit)?,
+                    10 => {
+                        self.close_editors()?;
+                        self.after_command(CommandResult::Exit)?
+                    }
                     _ => false
                 },
                 KeyCode::Esc => self.run_command(Exit)?,
@@ -261,7 +271,7 @@ impl App {
                     else { ScrollVertically(1) })?,
                 KeyCode::PageUp => self.run_command(ScrollVertically(-((self.height - TOP_LINE - 1) as isize)))?,
                 KeyCode::PageDown => self.run_command(ScrollVertically((self.height - TOP_LINE - 1) as isize))?,
-                KeyCode::Home => if event.modifiers.contains(KeyModifiers::CONTROL) {
+                KeyCode::Home => if event.modifiers.contains(KeyModifiers::CONTROL) && self.popup.is_none() {
                     self.selected = Selection::default();
                     self.need_update = true;
                     false
@@ -283,6 +293,10 @@ impl App {
                             'z' => self.run_command(Undo)?,
                             'Z' => self.run_command(Redo)?, // Ctrl+Shift+Z
                             'y' => self.run_command(Redo)?,
+                            'c' => {
+                                self.close_editors()?;
+                                self.after_command(CommandResult::Exit)?
+                            }
                             _ => self.run_command(KeyPress(c))?,
                         }
                     } else { self.run_command(KeyPress(c))? }
@@ -294,6 +308,17 @@ impl App {
     }
 
     fn run_command(&mut self, command: UserCommand) -> io::Result<(bool)> {
+        if let Some(popup) = &mut self.popup {
+            self.need_update = true;
+            return match popup.on_command(command) {
+                Some(result) => {
+                    self.popup = None;
+                    self.after_command(result)
+                }
+                None => Ok(false),
+            };
+        }
+
         let result =
             match command {
                 ChangeFieldOrder(order) => {
@@ -321,6 +346,30 @@ impl App {
         Ok(self.after_command(result)?)
     }
 
+    // commit an open in-place editor, if any, before saving or quitting
+    fn close_editors(&mut self) -> io::Result<()> {
+        if self.popup.is_some() { return Ok(()) }
+        let result = self.layouts.run_command(Exit, &self.data, &self.layout_config, &mut self.selected);
+        if !matches!(result, CommandResult::Exit) {
+            self.after_command(result)?;
+        }
+        Ok(())
+    }
+
+    fn save(&mut self, quit: bool) -> io::Result<bool> {
+        match self.layouts.save_document(&self.data) {
+            Ok(_) => {
+                self.modified = false;
+                Ok(quit)
+            }
+            Err(error) => {
+                self.popup = Some(Popup::message("Error", &format!("Cannot save the file: {error}")));
+                self.need_update = true;
+                Ok(false)
+            }
+        }
+    }
+
     fn after_command(&mut self, result: CommandResult) -> io::Result<(bool)> {
         match result {
             CommandResult::Redraw => {
@@ -331,9 +380,26 @@ impl App {
                 self.data.apply(&mut change);
                 self.layouts.update_after_data_changed(&self.data, &self.layout_config, self.selected.layout);
                 self.need_update_layout_height = true;
+                self.modified = true;
                 Ok(false)
             }
-            CommandResult::Exit => Ok(true),
+            CommandResult::ShowPopup(popup) => {
+                self.popup = Some(popup);
+                self.need_update = true;
+                Ok(false)
+            }
+            CommandResult::Exit => {
+                if !self.modified { return Ok(true) }
+                self.popup = Some(Popup::confirm("Exit", "Save the changes?", vec![
+                    PopupItem::new("Save", CommandResult::Save { quit: true }),
+                    PopupItem::new("Discard", CommandResult::Quit),
+                    PopupItem::new("Cancel", CommandResult::None),
+                ]));
+                self.need_update = true;
+                Ok(false)
+            }
+            CommandResult::Quit => Ok(true),
+            CommandResult::Save { quit } => self.save(quit),
 
             _ => Ok(false)
         }
@@ -346,12 +412,17 @@ impl App {
         if let Some(current) = self.layouts.items.get(self.selected.layout) {
             debug_assert!(current.layout.is_some());
             let percent = 100.0 * self.layouts.calc_relative_pos(self.selected.layout);
-            parts.push(current.get_status_string(self.selected.x, self.selected.y));
+            parts.push(current.get_status_error().unwrap_or_else(|| current.get_status_string(self.selected.x, self.selected.y)));
             parts.push(format!("{:.0}% {}", percent, config.field_order.first_letter()));
         }
 
         loop {
             let total_len: u16 = parts.iter().map(|s| s.len() as u16).sum();
+            if parts.len() == 1 { // the last part left is cut to the line width
+                let text: String = parts[0].chars().take((width - MARGIN_LEFT - MARGIN_RIGHT) as usize).collect();
+                let width = (width - MARGIN_LEFT) as usize;
+                return format!("{}{:<width$}", " ".repeat(MARGIN_LEFT as usize), text);
+            }
             if total_len < width - MARGIN_LEFT - MARGIN_RIGHT {
                 let avail_len = width - total_len - MARGIN_LEFT - MARGIN_RIGHT;
                 let span = avail_len / (parts.len() as u16 - 1);
@@ -372,8 +443,7 @@ impl App {
             } else {
                 match parts.len() { // remove parts of the line if no room
                     3 => { parts.remove(0); }
-                    2 => { parts.remove(1); }
-                    _ => return String::new(),
+                    _ => { parts.remove(1); }
                 }
             }
         }
@@ -413,7 +483,9 @@ impl App {
                 }
                 last_pos += item.height;
             }
-            self.stdout.queue(TextStyle::TopLine.activate())?;
+            // an error of the selected layout highlights the whole line
+            let error = self.layouts.items.get(self.selected.layout).is_some_and(|item| item.get_status_error().is_some());
+            self.stdout.queue(if error { TextStyle::StatusError } else { TextStyle::TopLine }.activate())?;
             self.stdout.queue(style::Print(self.get_top_line(self.width, &self.layout_config)))?;
         }
         Ok(())
@@ -445,61 +517,89 @@ impl App {
         }
     }
 
+    // the screen below the top line: the visible layouts with the popup over them;
+    // also the screen position of the text editor cursor if it is visible
+    fn compose(&mut self) -> (Vec<ScreenLine>, Option<(u16, u16)>) {
+        let body_height = (self.height - TOP_LINE) as usize;
+        let (layout_index, mut skip_lines) = self.first_visible_line();
+        self.layouts.ensure_loaded(&self.data, &self.layout_config, layout_index, 0, self.height as usize + skip_lines, &mut self.selected);
+
+        let mut lines = Vec::with_capacity(body_height);
+        // the screen line of the selected layout's first line (may be above the screen)
+        // and the column of its value area
+        let mut origin = None;
+        for index in layout_index..self.layouts.items.len() {
+            let item = &self.layouts.items[index];
+            let indent = self.layouts.indents[item.level() - 1];
+            let cursor = if index == self.selected.layout { Some((self.selected.x, self.selected.y)) } else { None };
+
+            let mut item_lines = item.get_screen(&self.data, self.layouts.width, indent, &self.layout_config, cursor);
+            if cursor.is_some() {
+                origin = Some((indent + 2, lines.len() as isize - skip_lines as isize));
+            }
+
+            if skip_lines > 0 {
+                item_lines.0.drain(..skip_lines);
+                skip_lines = 0;
+            }
+            lines.append(&mut item_lines.0);
+            if lines.len() >= body_height { break; }
+        }
+        lines.truncate(body_height);
+
+        // a position of the selected layout on the screen below the top line
+        let to_screen = |(x, y): (u16, usize)| -> Option<(u16, usize)> {
+            let (origin_x, origin_y) = origin?;
+            let y = origin_y + y as isize;
+            if y < 0 || y as usize >= body_height { return None }
+            Some((origin_x + x, y as usize))
+        };
+
+        let mut text_edit_cursor = None;
+        if let Some(popup) = &mut self.popup {
+            while lines.len() < body_height { // the popup may cover the free space below the data
+                let mut line = ScreenLine::new(self.width);
+                line.fix_length(self.width);
+                lines.push(line);
+            }
+            let anchor = popup.anchor().and_then(to_screen);
+            popup.draw(&mut lines, self.width, anchor);
+        } else if let Some(item) = self.layouts.items.get(self.selected.layout) {
+            text_edit_cursor = item.get_text_edit_cursor().and_then(to_screen).map(|(x, y)| (x, y as u16 + TOP_LINE));
+        }
+        (lines, text_edit_cursor)
+    }
+
     // output data to the screen
     fn update(&mut self) -> io::Result<()> {
         self.stdout.queue(cursor::MoveTo(0, 0))?;
 
-        let (layout_index, mut skip_lines) = self.first_visible_line();
-        self.layouts.ensure_loaded(&self.data, &self.layout_config, layout_index, 0, self.height as usize + skip_lines, &mut self.selected);
-
+        let (lines, text_edit_cursor) = self.compose();
+        let line_count = lines.len();
         self.print_top_line()?;
-        let mut y = TOP_LINE;
 
-        let mut text_edit_cursor = None;
         let mut current_style = TextStyle::Unknown;
-        for index in layout_index..self.layouts.items.len() {
-            let item = &mut self.layouts.items[index];
-            let indent = self.layouts.indents[item.level() - 1];
-            let cursor = if index == self.selected.layout { Some((self.selected.x, self.selected.y)) } else { None };
-
-            let mut lines = item.get_screen(&self.data, self.layouts.width, indent, &self.layout_config, cursor);
-            if cursor.is_some() {
-                debug_assert!(text_edit_cursor.is_none());
-                text_edit_cursor = item.get_text_edit_cursor().map(|(local_x, local_y)| { (indent + 2 + local_x, y + (local_y as u16)) });
-            }
-
-            if skip_lines > 0 {
-                lines.0.drain(..skip_lines);
-                skip_lines = 0;
-            }
-
-            for line in lines.0 {
-                let mut text = String::new();
-                for (c, s) in line.0 {
-                    if s != current_style {
-                        if !text.is_empty() {
-                            self.stdout.queue(current_style.activate())?;
-                            self.stdout.queue(style::Print(text))?;
-                            text = String::new();
-                        }
-                        current_style = s;
+        for line in lines {
+            let mut text = String::new();
+            for (c, s) in line.0 {
+                if s != current_style {
+                    if !text.is_empty() {
+                        self.stdout.queue(current_style.activate())?;
+                        self.stdout.queue(style::Print(text))?;
+                        text = String::new();
                     }
-                    text.push(c);
+                    current_style = s;
                 }
-                if !text.is_empty() {
-                    self.stdout.queue(current_style.activate())?;
-                    self.stdout.queue(style::Print(text))?;
-                }
-                self.stdout.queue(cursor::MoveToNextLine(1))?;
-                y += 1;
-                if y >= self.height { break; }
+                text.push(c);
             }
-            if y >= self.height { break; }
+            if !text.is_empty() {
+                self.stdout.queue(current_style.activate())?;
+                self.stdout.queue(style::Print(text))?;
+            }
+            self.stdout.queue(cursor::MoveToNextLine(1))?;
         }
-        if y < self.height { // fill the free space below if any
+        if line_count < (self.height - TOP_LINE) as usize { // fill the free space below if any
             self.stdout.queue(style::ResetColor)?;
-            // ?           self.stdout.execute(terminal::Clear(terminal::ClearType::FromCursorDown))?;
-
             self.stdout.queue(terminal::Clear(terminal::ClearType::FromCursorDown))?;
         }
 
@@ -515,37 +615,8 @@ impl App {
 
     #[cfg(test)]
     fn to_strings(&mut self) -> Vec<String> {
-        let mut y = TOP_LINE;
-        let mut res = vec![];
-
-        let (layout_index, mut skip_lines) = self.first_visible_line();
-        self.layouts.ensure_loaded(&self.data, &self.layout_config, layout_index, 0, self.height as usize + skip_lines, &mut self.selected);
-
-        let mut text_edit_cursor = None;
-        for index in layout_index..self.layouts.items.len() {
-            let item = &self.layouts.items[index];
-            let cursor = if index == self.selected.layout { Some((self.selected.x, self.selected.y)) } else { None };
-            let indent = self.layouts.indents[item.level() - 1];
-
-            let mut lines = item.get_screen(&self.data, self.layouts.width, indent, &self.layout_config, cursor);
-            if cursor.is_some() {
-                debug_assert!(text_edit_cursor.is_none());
-                text_edit_cursor = item.get_text_edit_cursor().map(|(local_x, local_y)| { (indent + 2 + local_x, y + (local_y as u16)) });
-            }
-
-            if skip_lines > 0 {
-                lines.0.drain(..skip_lines);
-                skip_lines = 0;
-            }
-
-            for line in lines.0 {
-                res.push(line.0.into_iter().map(|v| v.0).collect());
-                y += 1;
-                if y >= self.height { break; }
-            }
-            if y >= self.height { break; }
-        }
-
+        let (lines, text_edit_cursor) = self.compose();
+        let mut res: Vec<String> = lines.into_iter().map(|line| line.0.into_iter().map(|v| v.0).collect()).collect();
         if let Some((x, y)) = text_edit_cursor {
             res.push(format!("cursor: {x},{y}"));
         }
@@ -2592,7 +2663,9 @@ message M2 { int32 i2 = 2; int32 i3 = 3; }
         assert_eq!(app.to_strings(), [
             " f1: 5000000000   uint32 ",
             "cursor: 15,1"]);
-        assert!(app.layouts.items[0].get_status_string(1, 0).contains("uint32"));
+        assert!(app.layouts.items[0].get_status_error().unwrap().contains("uint32"));
+        // the error is cut to the screen width
+        assert_eq!(app.get_top_line(app.width, &app.layout_config), " '5000000000' is not a v ");
         match &app.data.get_field(&[(1, 0).into()]).unwrap().value {
             SCALAR(U32(value)) => assert_eq!(*value, 7), // data not changed
             _ => panic!("f1 is not an uint32"),
@@ -2852,6 +2925,179 @@ message M2 { int32 f9=9; }
             SCALAR(I32(value)) => assert_eq!(*value, 42),
             _ => panic!("f1 is not an int32"),
         }
+    }
+
+    // text of the screen chars shown with the selected popup item style
+    fn popup_selection(app: &mut App) -> String {
+        let (lines, _) = app.compose();
+        lines.iter().flat_map(|line| line.0.iter()).filter(|v| v.1 == TextStyle::PopupSelected).map(|v| v.0).collect()
+    }
+
+    #[test]
+    fn enum_value_chosen_from_list() {
+        let data = make_one_field_data("enum E1 { V1=0; V2=1; V3=2; }\nmessage M { E1 e1=1; }", ENUM(0));
+        let mut app = App::for_tests(data.0, data.1, FieldOrder::Proto, 25, 7).unwrap();
+
+        // Enter on the value opens the list below it, the current value selected
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        app.run_command(CollapsedToggle).unwrap();
+        assert_eq!(app.to_strings(), [
+            " e1: V1               E1 ",
+            "   ┌─ E1 ─┐              ",
+            "   │ V1   │              ",
+            "   │ V2   │              ",
+            "   │ V3   │              ",
+            "   └──────┘              ",
+        ]);
+        assert_eq!(popup_selection(&mut app), " V1   ");
+
+        // the list takes the commands: the cursor of the layouts does not move
+        app.run_command(ScrollVertically(1)).unwrap();
+        assert_eq!(popup_selection(&mut app), " V2   ");
+        app.run_command(CollapsedToggle).unwrap();
+        app.after_event().unwrap();
+        assert!(app.popup.is_none());
+        assert!(app.modified);
+        assert_eq!(app.to_strings(), [" e1: V2               E1 "]);
+        match &app.data.get_field(&[(1, 0).into()]).unwrap().value {
+            SCALAR(ENUM(value)) => assert_eq!(*value, 1),
+            _ => panic!("e1 is not an enum"),
+        }
+    }
+
+    #[test]
+    fn enum_list_closed_with_esc() {
+        let data = make_one_field_data("enum E1 { V1=0; V2=1; }\nmessage M { E1 e1=1; }", ENUM(1));
+        let mut app = App::for_tests(data.0, data.1, FieldOrder::Proto, 25, 7).unwrap();
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        app.run_command(CollapsedToggle).unwrap();
+        assert_eq!(popup_selection(&mut app), " V2   ");
+
+        // Esc closes the list leaving the value and the application
+        app.run_command(ScrollVertically(-1)).unwrap();
+        assert!(!app.run_command(UserCommand::Exit).unwrap());
+        app.after_event().unwrap();
+        assert!(app.popup.is_none());
+        assert!(!app.modified);
+        assert_eq!(app.to_strings(), [" e1: V2               E1 "]);
+    }
+
+    #[test]
+    fn enum_list_choosing_default_inserts_field() {
+        let data = make_no_field_data("enum E1 { V1=0; V2=1; }\nmessage M { E1 e1=1; }");
+        let mut app = App::for_tests(data.0, data.1, FieldOrder::Proto, 25, 7).unwrap();
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        app.run_command(CollapsedToggle).unwrap();
+        app.run_command(CollapsedToggle).unwrap(); // the shown default V1
+        app.after_event().unwrap();
+        match &app.data.get_field(&[(1, 0).into()]).unwrap().value {
+            SCALAR(ENUM(value)) => assert_eq!(*value, 0),
+            _ => panic!("e1 is not an enum"),
+        }
+    }
+
+    #[test]
+    fn enum_list_scrolls_when_higher_than_screen() {
+        let data = make_one_field_data("enum E1 { A=0; B=1; C=2; D=3; E=4; F=5; G=6; }\nmessage M { E1 e1=1; }", ENUM(0));
+        let mut app = App::for_tests(data.0, data.1, FieldOrder::Proto, 25, 6).unwrap();
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        app.run_command(CollapsedToggle).unwrap();
+        // 4 lines below the value: 2 items visible, ▼ shows more items below
+        assert_eq!(app.to_strings(), [
+            " e1: A                E1 ",
+            "   ┌─ E1 ─┐              ",
+            "   │ A    │              ",
+            "   │ B    ▼              ",
+            "   └──────┘              ",
+        ]);
+
+        // moving down scrolls the list keeping the selected item visible
+        app.run_command(ScrollVertically(1)).unwrap();
+        app.run_command(ScrollVertically(1)).unwrap();
+        assert_eq!(app.to_strings(), [
+            " e1: A                E1 ",
+            "   ┌─ E1 ─┐              ",
+            "   │ B    ▲              ",
+            "   │ C    ▼              ",
+            "   └──────┘              ",
+        ]);
+        assert_eq!(popup_selection(&mut app), " C    ");
+
+        // End selects the last item, PageUp moves by the visible items
+        app.run_command(UserCommand::End).unwrap();
+        assert_eq!(popup_selection(&mut app), " G    ");
+        app.run_command(ScrollVertically(-20)).unwrap();
+        assert_eq!(popup_selection(&mut app), " F    ");
+
+        // a typed char jumps to the item starting with it
+        app.run_command(KeyPress('d')).unwrap();
+        assert_eq!(app.to_strings(), [
+            " e1: A                E1 ",
+            "   ┌─ E1 ─┐              ",
+            "   │ D    ▲              ",
+            "   │ E    ▼              ",
+            "   └──────┘              ",
+        ]);
+        app.run_command(CollapsedToggle).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [" e1: D                E1 "]);
+    }
+
+    #[test]
+    fn exit_asks_to_save_changes() {
+        let data = make_one_field_data("message M { int32 f1=1; }", I32(1));
+        let mut app = App::for_tests(data.0, data.1, FieldOrder::Proto, 31, 7).unwrap();
+
+        // no changes: Esc closes the application
+        assert!(app.run_command(UserCommand::Exit).unwrap());
+
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        app.run_command(KeyPress('2')).unwrap();
+        app.run_command(UserCommand::Exit).unwrap(); // commits the editor
+        app.after_event().unwrap();
+        assert!(app.modified);
+
+        // with changes Esc asks instead of closing
+        assert!(!app.run_command(UserCommand::Exit).unwrap());
+        assert_eq!(app.to_strings(), [
+            "┌─ Exit ──────────────────────┐",
+            "│ Save the changes?           │",
+            "│                             │",
+            "│ [Save]  [Discard]  [Cancel] │",
+            "└─────────────────────────────┘",
+            "                               ",
+        ]);
+        assert_eq!(popup_selection(&mut app), "[Save]");
+
+        // Cancel keeps the application open
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        assert_eq!(popup_selection(&mut app), "[Cancel]");
+        assert!(!app.run_command(CollapsedToggle).unwrap());
+        assert!(app.popup.is_none());
+
+        // Discard closes it without saving
+        app.run_command(UserCommand::Exit).unwrap();
+        app.run_command(ScrollHorizontally(1)).unwrap();
+        assert!(app.run_command(CollapsedToggle).unwrap());
+    }
+
+    #[test]
+    fn message_box_centered() {
+        let data = make_one_field_data("message M { int32 f1=1; }", I32(1));
+        let mut app = App::for_tests(data.0, data.1, FieldOrder::Proto, 25, 7).unwrap();
+        app.after_command(CommandResult::ShowPopup(Popup::message("Error", "No room"))).unwrap();
+        // centered on the screen below the top line
+        assert_eq!(app.to_strings(), [
+            " f1: 1 ┌─ Error ─┐ int32 ",
+            "       │ No room │       ",
+            "       │         │       ",
+            "       │  [OK]   │       ",
+            "       └─────────┘       ",
+            "                         ",
+        ]);
+        assert!(!app.run_command(CollapsedToggle).unwrap());
+        assert!(app.popup.is_none());
     }
 
     // TODO unknown field layout

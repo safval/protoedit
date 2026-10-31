@@ -14,6 +14,7 @@ use crate::trz::{Change, ChangeType};
 use crate::wire::{FieldPath, FieldPos, FieldValue, MessageData, ScalarValue};
 use crate::wire::ScalarValue::{BYTES, STR};
 use crate::text_edit::*;
+use crate::popup::{Popup, PopupItem};
 
 pub(crate) const MARGIN_RIGHT: u16 = 1;
 pub(crate) const MARGIN_LEFT: u16 = 1;
@@ -101,11 +102,11 @@ pub enum CommandResult {
     None,
     Redraw,
     ChangeData(Change),
-    ShowMenu(Vec<String>),
-    ShowMessage(String),
-    ShowError(String),
+    ShowPopup(Popup), // open the upper UI layer: a message or a list to choose from
     StartEdit(FieldPath, u16, u16),
-    Exit, // close the application
+    Exit, // close the application, asks to save the changes if any
+    Quit, // close the application without questions
+    Save { quit: bool },
 }
 
 // Data on the screen arranged in layouts, each layout displayed as one or more line
@@ -168,6 +169,9 @@ pub trait ViewLayout {
     // get ids of children fields already shown in this layout
     fn get_consumed_fields(&self, root: &MessageData, path: &FieldPath, config: &LayoutConfig) -> HashSet<i32> { HashSet::new() }
     fn get_status_string(&self, cursor_x: u16, cursor_y: usize) -> String { String::new() }
+    // an error to show in the status line instead of the status string,
+    // e.g. the value of an in-place editor cannot be committed
+    fn get_status_error(&self) -> Option<String> { None }
 }
 
 fn on_command_default_handler(root: &MessageData, path: &FieldPath, amount: usize, command: UserCommand, config: &LayoutConfig, width: u16, indent: u16, preferred_column: Option<u16>, cursor_x: &mut u16, cursor_pos: &mut usize) -> CommandResult {
@@ -349,6 +353,9 @@ pub enum TextStyle {
     Divider,
     Bookmark,
     TopLine, // top line with different status information
+    StatusError, // top line showing an error
+    Popup, // a message box or a list over the layouts
+    PopupSelected,
     Unknown,
 }
 
@@ -626,6 +633,41 @@ impl ScalarLayout {
         true
     }
 
+    // Enter on an enum value: the list of the enum names to choose the new value
+    // from; None if the field is not an enum or no value is selected
+    fn enum_popup(&self, root: &MessageData, path: &FieldPath, amount: usize, cursor_x: u16, cursor_pos: usize) -> Option<Popup> {
+        let def = root.get_field_definition(path)?;
+        let enum_proto = def.enum_proto()?;
+        let index = self.data_index_at_cursor(cursor_x, cursor_pos);
+        if index == usize::MAX || (amount > 0 && index >= amount) { return None }
+        let &(x_base, _) = self.spans.get(cursor_pos)?.get(cursor_x as usize - 1)?;
+
+        let path = path.with_last_index(path.0.last().unwrap().index + index);
+        let current =
+            if amount == 0 { // the field is absent from the data, its default value is shown
+                let FieldValue::SCALAR(ScalarValue::ENUM(value)) = def.default() else { return None };
+                value
+            } else {
+                let FieldValue::SCALAR(ScalarValue::ENUM(value)) = root.get_field(&path.0)?.value else { return None };
+                value
+            };
+
+        let items = enum_proto.variants.iter().map(|(name, id, _)| {
+            let value = FieldValue::SCALAR(ScalarValue::ENUM(*id));
+            let action =
+                if amount == 0 { // choosing the shown default value creates the field
+                    CommandResult::ChangeData(Change { path: path.clone(), action: ChangeType::Insert(value) })
+                } else if *id == current {
+                    CommandResult::Redraw // unchanged
+                } else {
+                    CommandResult::ChangeData(Change { path: path.clone(), action: ChangeType::Overwrite(value) })
+                };
+            PopupItem::new(name, action)
+        }).collect();
+        let selected = enum_proto.variants.iter().position(|v| v.1 == current).unwrap_or(0);
+        Some(Popup::list(&def.typename(), items, selected, Some((x_base, cursor_pos))))
+    }
+
     // parse the editor text and close the editor turning the text into a data
     // change; empty text reverts the edit; on a parse error the editor stays open
     // showing the error, unless the focus is leaving (force) and it cannot stay —
@@ -660,12 +702,8 @@ impl ScalarLayout {
 }
 impl ViewLayout for ScalarLayout {
     fn layout_type(&self) -> LayoutType { LayoutType::Scalar }
-    fn get_status_string(&self, cursor_x: u16, cursor_y: usize) -> String {
-        //format!("/{}", self.amount)
-        if let Some(edit) = &self.edit {
-            if let Some(error) = &edit.error { return error.clone() }
-        }
-        String::new()
+    fn get_status_error(&self) -> Option<String> {
+        self.edit.as_ref().and_then(|edit| edit.error.clone())
     }
     fn calc_sizes(&mut self, root: &MessageData, path: &FieldPath, amount: usize, config: &LayoutConfig, width: u16, negotiator: &mut IndentsCalc) -> usize {
         if let Some(field_proto) = root.get_field_definition(path) {
@@ -795,6 +833,8 @@ impl ViewLayout for ScalarLayout {
             UserCommand::CollapsedToggle => { // Enter: open the editor on the current value or commit it
                 if self.edit.is_some() {
                     self.commit_editor(root, path, amount, false)
+                } else if let Some(popup) = self.enum_popup(root, path, amount, *cursor_x, *cursor_pos) {
+                    CommandResult::ShowPopup(popup)
                 } else if self.open_editor(root, path, amount, config, *cursor_x, *cursor_pos, true) {
                     CommandResult::Redraw
                 } else { CommandResult::None }
@@ -1638,6 +1678,9 @@ impl TextStyle {
 
         let foreground_color = match self {
             TextStyle::TopLine => Color::Black,
+            TextStyle::StatusError => Color::White,
+            TextStyle::Popup => Color::White,
+            TextStyle::PopupSelected => Color::Black,
             TextStyle::FieldName => Color::Green,
             TextStyle::SelectedValue |
             TextStyle::SelectedFieldIndex |
@@ -1655,6 +1698,9 @@ impl TextStyle {
 
         let background_color = match self {
             TextStyle::TopLine => Color::DarkCyan,
+            TextStyle::StatusError => Color::DarkRed,
+            TextStyle::Popup => Color::DarkBlue,
+            TextStyle::PopupSelected => Color::DarkCyan,
             TextStyle::EditCursor => Color::Grey, // static reverse-video cell, does not blink
             TextStyle::SelectedValue |
             TextStyle::SelectedFieldName |
@@ -1686,6 +1732,9 @@ impl LayoutParams {
             return layout.get_status_string(cursor_x, cursor_y);
         }
         String::new()
+    }
+    pub fn get_status_error(&self) -> Option<String> {
+        self.layout.as_ref().and_then(|layout| layout.get_status_error())
     }
     pub fn calc_sizes(&mut self, root: &MessageData, config: &LayoutConfig, width: u16, negotiator: &mut IndentsCalc) {
         if let Some(layout) = &mut self.layout {

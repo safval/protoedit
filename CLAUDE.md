@@ -20,6 +20,8 @@ cargo run -- "data.pb;schema.proto;Root"  # explicit schema + root message
 
 CI (`.github/workflows/rust.yml`) runs only `cargo build` and `cargo test` — there is no configured lint/format step.
 
+Commit directly to `main`; do not create feature branches.
+
 ### CLI argument format
 
 A single positional argument, semicolon-separated: `data.pb;format.proto;message_name`.
@@ -28,7 +30,7 @@ A single positional argument, semicolon-separated: `data.pb;format.proto;message
 - `-I`/`--proto_path <dir>` adds directories for resolving `import`ed proto files (must be absolute paths).
 - `-d`/`--delimited` reads the data file as a stream of length-delimited records (varint length prefix before each message, the `writeDelimitedTo`/`pb_encode_delimited` framing). The records become a repeated field of a hidden wrapper message synthesized by `ProtoData::make_delimited_wrapper`; `MessageData::new_delimited`/`write_delimited` handle the framing, and `Layouts.delimited` makes saving write the prefixes back.
 
-`resources/` holds example `.pb`/`.proto` pairs (`ints`, `str`, `bytes`, `mega`, `test_data_1`) for manual testing.
+`resources/` holds example `.pb`/`.proto` pairs (`ints`, `str`, `bytes`, `enum`, `mega`, `test_data_1`) for manual testing.
 
 ## Architecture
 
@@ -48,6 +50,7 @@ Two parallel data models flow through the program and must be kept consistent wi
 | `view.rs` | Presentation: `Layouts`, the `ViewLayout` trait + implementations, `UserCommand`, `CommandResult`, `FieldOrder`, `LayoutConfig`, `TextStyle`. |
 | `trz.rs` | Mutation records (`Change`, `ChangeType`, `History`) used for editing and undo. |
 | `text_edit.rs` | In-place text/string editing helpers (`TextEditor`, `TextLines`). |
+| `popup.rs` | The upper UI layer drawn over the layouts: `Popup` (message box with buttons, or a scrollable list such as enum values). Each `PopupItem` carries the `CommandResult` the `App` runs when it is chosen. While `App.popup` is open, `App::run_command` routes all commands to it. |
 | `pb.pest` | PEG grammar (pest) for the `.proto` subset that is supported. |
 
 ### Critical invariants

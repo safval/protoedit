@@ -183,6 +183,7 @@ pub trait FieldProto {
     fn get_common_definition(&self) -> &CommonFieldProto;
     //fn message_type_name(&self) -> &str { "" } // only if the field stores a message
     fn get_enum_name_by_index(&self, i: i32) -> Option<&str> { None }
+    fn enum_proto(&self) -> Option<&EnumProtoPtr> { None } // only if the field stores an enum
     fn is_message(&self) -> bool { false }
     fn link_user_types(&self, _: &Vec<EnumProtoPtr>, _: &Vec<MessageProtoPtr>) {}
 }
@@ -684,6 +685,7 @@ impl FieldProto for EnumOrMessageFieldDefinition {
     }
     fn get_common_definition(&self) -> &CommonFieldProto { &self.common }
     fn is_message(&self) -> bool { self.is_message.get().is_some() }
+    fn enum_proto(&self) -> Option<&EnumProtoPtr> { self.enum_proto.get() }
     fn get_enum_name_by_index(&self, i: i32) -> Option<&str> {
         for v in &self.enum_proto.get()?.variants {
             if v.1 == i {
