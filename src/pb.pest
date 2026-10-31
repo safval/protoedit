@@ -4,18 +4,21 @@ option = { "option" ~ ws+ ~ name ~ ws* ~ "=" ~ ws* ~ (!";" ~ ANY)* ~ ";" ~ws* }
 name = { (ASCII_ALPHA|"_") ~ (ASCII_ALPHANUMERIC|"_")* }
 typename = { (ASCII_ALPHA|"_") ~ (ASCII_ALPHANUMERIC|"_"|".")* }
 integer = { ("-"|"+")? ~ ASCII_DIGIT{1,9} }
-cardinality = { "optional" | "repeated" }
+cardinality = { "optional" | "repeated" | "required" } // proto2 required is read as optional
 ws = _{ " " | "\t" | NEWLINE }
 COMMENT = ${ SingleLineComment }
 SingleLineComment = { "//" ~ (!"\n" ~ ANY)* }
 
 mapname = { "map<" ~ ws* ~ name ~ ws* ~ "," ~ ws* ~ typename ~ ws* ~ ">" }
-msg_field = { cardinality? ~ ws* ~ (mapname|typename) ~ ws+ ~ name ~ ws* ~ "=" ~ ws* ~ integer ~ ws* ~ ("[" ~ (ASCII_ALPHANUMERIC|"_"|"="|" ")* ~"]")? ~ ws* ~ ";" ~ ws* }
+// options of a field or an enum value, e.g. [deprecated = true, json_name = "x"]: skipped;
+// atomic, so "//" inside a string value is not taken for a comment
+field_options = @{ "[" ~ ("\"" ~ (!"\"" ~ ANY)* ~ "\"" | !"]" ~ ANY)* ~ "]" }
+msg_field = { cardinality? ~ ws* ~ (mapname|typename) ~ ws+ ~ name ~ ws* ~ "=" ~ ws* ~ integer ~ ws* ~ field_options? ~ ws* ~ ";" ~ ws* }
 reserved = _{ "reserved" ~ (ASCII_ALPHANUMERIC | "," | "\"" | " " | "\t")* ~ ";" ~ ws* }
 one_of = { "oneof" ~ ws+ ~ name ~ ws* ~ "{" ~ ws* ~ msg_field+ ~ "}" ~ ws* }
 message = { "message" ~ ws+ ~ name ~ ws* ~ "{" ~ (ws* ~ (msg_field | reserved | one_of | enum1 | message))* ~ ws* ~ "}" }
 
-enum_field = { name ~ ws* ~ "=" ~ ws* ~ integer ~ ws* ~ ";" ~ ws* }
+enum_field = { name ~ ws* ~ "=" ~ ws* ~ integer ~ ws* ~ field_options? ~ ws* ~ ";" ~ ws* }
 enum1 = { "enum" ~ ws+ ~ name ~ ws* ~ "{" ~ (ws* ~ (enum_field | option))+ ~ ws* ~ "}" }
 
 empty_line = _{ (" "|"\t")* ~ NEWLINE }

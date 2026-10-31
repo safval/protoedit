@@ -199,7 +199,7 @@ impl Debug for FieldValue {
 
 impl ScalarValue {
     pub fn varint_size(value: i128) -> usize {
-        if value < 0 { todo!() }
+        if value < 0 { return 10; } // a negative int32/int64/enum is written as 64 bits
         if value <= 0x00_0000_0000_0000_007f { return 1; }
         if value <= 0x00_0000_0000_0000_3fff { return 2; }
         if value <= 0x00_0000_0000_001f_ffff { return 3; }
@@ -218,11 +218,11 @@ impl ScalarValue {
             ScalarValue::UF32(_) | ScalarValue::SF32(_) | ScalarValue::F32(_) => 4,
             ScalarValue::UF64(_) | ScalarValue::SF64(_) | ScalarValue::F64(_) => 8,
             ScalarValue::I32(v) => Self::varint_size(*v as i128),
-            ScalarValue::S32(v) => Self::varint_size((*v as i128) << 1),
+            ScalarValue::S32(v) => Self::varint_size(zigzag32(*v) as i128),
             ScalarValue::U32(v) => Self::varint_size(*v as i128),
             ScalarValue::U64(v) => Self::varint_size(*v as i128),
             ScalarValue::I64(v) => Self::varint_size(*v as i128),
-            ScalarValue::S64(v) => Self::varint_size((*v as i128) << 1),
+            ScalarValue::S64(v) => Self::varint_size(zigzag64(*v) as i128),
             ScalarValue::STR(v) => v.as_bytes().len(),
             ScalarValue::BYTES(v) => v.len(),
             ScalarValue::UNKNOWN(tag, bytes) => Self::varint_size(tag.first_number as i128) + bytes.len(),
@@ -282,7 +282,8 @@ impl<'proto> MessageData {
         let mut flds = Vec::<(FieldProtoPtr, usize, FieldValue)>::new();
         while *limit > 0 {
             let mut tag = reader.read_tag(limit)?;
-            match def.get_field(tag.field_id()) {
+            // a field of an unresolved type is read like a field missing from the definition
+            match def.get_field(tag.field_id()).filter(|field_def| !field_def.is_unresolved()) {
                 Some(field_def) => { // read submessage field
                     if field_def.is_message() {
                         *limit -= tag.length;
@@ -868,6 +869,59 @@ mod scalars {
         }
     }
     #[test]
+    fn sint_zigzag_encoding() {
+        // the bytes are produced by the reference protobuf implementation
+        let cases_32: [(i32, &[u8]); 5] = [(-1, &[0x01]), (-2, &[0x03]), (1, &[0x02]),
+            (i32::MIN, &[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]), (i32::MAX, &[0xFE, 0xFF, 0xFF, 0xFF, 0x0F])];
+        for (value, bytes) in cases_32 {
+            let mut buf = vec![];
+            SInt32FieldProto(CommonFieldProto::default()).write(&mut buf, &ScalarValue::S32(value)).unwrap();
+            assert_eq!(buf, bytes);
+            assert_eq!(ScalarValue::S32(value).len(), bytes.len());
+        }
+        let cases_64: [(i64, &[u8]); 3] = [(-1, &[0x01]), (-2, &[0x03]),
+            (i64::MIN, &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01])];
+        for (value, bytes) in cases_64 {
+            let mut buf = vec![];
+            SInt64FieldProto(CommonFieldProto::default()).write(&mut buf, &ScalarValue::S64(value)).unwrap();
+            assert_eq!(buf, bytes);
+            assert_eq!(ScalarValue::S64(value).len(), bytes.len());
+        }
+        // negative int32/int64/enum values are written as 64 bits
+        assert_eq!(ScalarValue::I32(-1).len(), 10);
+        assert_eq!(ScalarValue::ENUM(-1).len(), 10);
+    }
+
+    #[test]
+    fn empty_unknown_field() {
+        let binary_input = [0x08, 0x01, 0x12, 0x00]; // a = 1; field 2 of zero length
+        let proto = ProtoData::new("message M { int32 a = 1; }").unwrap().finalize().unwrap();
+        let mut limit = binary_input.len() as u32;
+        let root_msg = proto.auto_detect_root_message().unwrap();
+        let mut read = PbReader::new(binary_input.as_slice());
+        let data = MessageData::new(&mut read, &proto, root_msg.clone(), &mut limit).unwrap();
+        let mut output = Vec::new();
+        data.write(&mut output, &proto, root_msg).unwrap();
+        assert_eq!(output, binary_input);
+    }
+
+    #[test]
+    fn unresolved_type_read_as_unknown() {
+        let binary_input = [0x08, 0x01, 0x12, 0x02, 0x08, 0x05]; // a = 1; m = { 1: 5 }
+        let proto = ProtoData::new("message M { int32 a = 1; Missing m = 2; }").unwrap().finalize().unwrap();
+        let mut limit = binary_input.len() as u32;
+        let root_msg = proto.auto_detect_root_message().unwrap();
+        let mut read = PbReader::new(binary_input.as_slice());
+        let data = MessageData::new(&mut read, &proto, root_msg.clone(), &mut limit).unwrap();
+        assert!(matches!(data.fields[1].value, FieldValue::SCALAR(ScalarValue::UNKNOWN(..))));
+
+        // kept as it is
+        let mut output = Vec::new();
+        data.write(&mut output, &proto, root_msg).unwrap();
+        assert_eq!(output, binary_input);
+    }
+
+    #[test]
     fn write_and_read_float_fields() {
         for value in [0f32, 1f32, f32::MIN, f32::MAX] {
             wr_scalar_fn(Box::new(FloatFieldDefinition(CommonFieldProto::default())), ScalarValue::F32(value), 4);
@@ -911,6 +965,7 @@ mod read_message {
     use crate::wire::{FieldPos, FieldValue, MessageData, ScalarValue};
     use crate::wire::ScalarValue::{I32, SF32, STR};
     use crate::trz::Change;
+    use crate::typedefs::{CommonFieldProto, FieldProto, SInt32FieldProto, SInt64FieldProto};
 
     fn all_scalar_proto() -> &'static str {
         r#"
@@ -1149,10 +1204,10 @@ message Shutdown { }
 
         let expected = r#"message AllScalars {
   f_i32 = -2147483648
-  f_s32 = -2147483647
+  f_s32 = -2147483648
   f_fs32 = -2147483648
   f_i64 = -9223372036854775808
-  f_s64 = -9223372036854775807
+  f_s64 = -9223372036854775808
   f_fi64 = -9223372036854775808
   f_f32 = -3.4028235e38
   f_f64 = -1.7976931348623157e308

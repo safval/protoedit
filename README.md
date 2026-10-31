@@ -2,11 +2,10 @@
 
 Terminal-based [protobuf](https://protobuf.dev) data files editor.
 
-Scalar, string and bytes fields are editable; enum fields can be viewed, but not edited yet.
-
 Fields missing from the .proto file, for example when the file is written by a newer
-version of the format, are shown as raw bytes and kept as they are, so a file saved
-without changes is byte-identical to the original.
+version of the format, and fields of types not found in it (e.g. a missing import) are
+shown as raw bytes and kept as they are, so a file saved without changes is
+byte-identical to the original.
 
 ## Command Line Interface
 
@@ -32,16 +31,26 @@ Options:
 
 To edit a scalar field, type a value over it, or press Enter to edit the current one.
 To edit a string or bytes field, press the Right arrow on it. Esc or moving to another
-field commits the edit.
+field commits the edit. A field missing from the data is shown with its default value and
+a minus before the type name; editing it or pressing Ins on its name creates the field.
+
+To change an enum value, press Enter on it and choose the new one from the list.
+
+Enter on the name of a `oneof` member lists all the members of the `oneof`: choosing
+an absent one sets it with the default value, choosing the set message collapses or
+expands it.
+
+In a list, Up/Down, PgUp/PgDn and Home/End move the selection, a typed letter jumps to the
+next item starting with it, Enter chooses the item and Esc closes the list.
 
 F2 writes the result over the original file (through a temporary file) without making
-a backup, and quitting does not ask about unsaved changes.
+a backup. Quitting with unsaved changes asks whether to save them.
 
 ## Hotkeys
 
 F2 - Save file
 
-F3 - Data view format: as in the proto file, decimal, hex (planned for the next version)
+F3 - Data view format: as in the proto file, decimal, hex (planned)
 
 F4 - Change field sort order. Four variants available:
 
@@ -53,13 +62,14 @@ F4 - Change field sort order. Four variants available:
  Shift+F4 switches the order backwards. The first char of the current order is shown in
  the right part of the top line, next to the position percentage.
 
-F5/Enter - Expand/Collapse data, on a message or a collapsed field
+F5/Enter - Expand/Collapse data, on a message or a collapsed field (Enter on a `oneof`
+member lists the members of the `oneof` instead)
 
-F6 - Comments visibility: hidden, inline, above the field (planned for the next version)
+F6 - Comments visibility: hidden, inline, above the field (planned)
 
-F10 - Quit
+F10, Ctrl+C - Quit
 
-Esc - Close the editor of the current field, or quit if no editor is open
+Esc - Close the editor of the current field or a list, or quit if nothing is open
 
 Ctrl+Up/Down - Navigate field of a message
 
@@ -83,9 +93,10 @@ more than 10 thousand items. Nested data may hold much more: the mega.pb example
 1 million values, split between repeated fields of 100 items each.
 
 The .proto parser supports a subset of the format: `message`, `enum`, `oneof`, `map`,
-`reserved` and `option`, with `optional` and `repeated` fields. Only `//` comments are
-recognized, they are kept for the future versions, but not shown yet; `/* */` comments,
-proto2 `required` fields, groups, services and extensions are not supported.
+`reserved` and `option`, with `optional` and `repeated` fields; the options of fields and
+enum values are skipped. Comments are not shown yet. proto2 files are read like proto3
+ones: `required` fields are treated as `optional`, and default values set with
+`[default = ...]` are not used. Groups, services and extensions are not supported.
 
 ## Examples
 
@@ -95,6 +106,10 @@ Type `protoedit resources/filename.pb` to open a file (or `cargo run --release -
  * ints.pb - simple integer data example
  * str.pb - multiline string example
  * bytes.pb - a field with 1000 random bytes
+ * enum.pb - enum fields: a short and a long list of values, a repeated enum, an absent
+   field, a value missing from the enum
+ * oneof.pb - `oneof` fields: in the root and in a nested message, with an enum and a message
+   member, an empty `oneof` and an invalid one with two members set
  * mega.pb - 1 million random values in three-level structures
  * test_data_1.pb - simple nested data example
 

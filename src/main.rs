@@ -378,8 +378,12 @@ impl App {
                 Ok(false)
             }
             CommandResult::ChangeData(mut change) => {
-                // inserting a member of a oneof deletes the member set before
                 if let ChangeType::Insert(_) = &change.action {
+                    // a field of an unresolved type cannot be created, its wire type is unknown
+                    if self.data.get_field_definition(&change.path).is_some_and(|def| def.is_unresolved()) {
+                        return Ok(false);
+                    }
+                    // inserting a member of a oneof deletes the member set before
                     let deleted = self.data.oneof_members_set(&change.path);
                     if !deleted.is_empty() {
                         let ChangeType::Insert(value) = change.action else { unreachable!() };
@@ -3260,6 +3264,33 @@ message M2 { int32 f9=9; }
             "  point:                    P ",
             "        x: 0           -int32 ",
         ]);
+    }
+
+    #[test]
+    fn collapse_message_with_negative_value() {
+        // m = { x = -1 }, the int32 is written as 10 bytes
+        let binary_input = [0x0A, 0x0B, 0x08, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01];
+        let proto = ProtoData::new("message P { int32 x = 1; }\nmessage M { P m = 1; }").unwrap().finalize().unwrap();
+        let mut limit = binary_input.len() as u32;
+        let root_msg = proto.auto_detect_root_message().unwrap();
+        let mut read = PbReader::new(binary_input.as_slice());
+        let data = MessageData::new(&mut read, &proto, root_msg, &mut limit).unwrap();
+        let mut app = App::for_tests(data, proto, FieldOrder::Proto, 30, 5).unwrap();
+
+        app.run_command(CollapsedToggle).unwrap();
+        app.after_event().unwrap();
+        assert_eq!(app.to_strings(), [" m: ... 11                  P "]); // the length prefix in the data
+    }
+
+    #[test]
+    fn unresolved_type_cannot_be_inserted() {
+        let data = make_one_field_data("message M { int32 a = 1; Missing m = 2; }", I32(1));
+        let mut app = App::for_tests(data.0, data.1, FieldOrder::Proto, 30, 5).unwrap();
+        app.run_command(ScrollVertically(1)).unwrap();
+        app.run_command(InsertData).unwrap();
+        app.after_event().unwrap();
+        assert!(app.data.get_field(&[(2, 0).into()]).is_none());
+        assert!(!app.modified);
     }
 
     // TODO unknown field layout

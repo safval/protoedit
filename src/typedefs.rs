@@ -155,6 +155,12 @@ impl CommonFieldProto {
     }
 }
 
+// zigzag encoding of sint32/sint64: 0, -1, 1, -2, 2 ... are written as 0, 1, 2, 3, 4 ...
+pub fn zigzag32(value: i32) -> u32 { ((value << 1) ^ (value >> 31)) as u32 }
+pub fn unzigzag32(value: u32) -> i32 { ((value >> 1) as i32) ^ -((value & 1) as i32) }
+pub fn zigzag64(value: i64) -> u64 { ((value << 1) ^ (value >> 63)) as u64 }
+pub fn unzigzag64(value: u64) -> i64 { ((value >> 1) as i64) ^ -((value & 1) as i64) }
+
 // shared by the `parse` implementations of the numeric field types
 fn parse_number<T: std::str::FromStr>(text: &str, typename: &str) -> Result<T, String> {
     text.parse::<T>().map_err(|_| format!("'{}' is not a valid {}", text, typename))
@@ -185,6 +191,8 @@ pub trait FieldProto {
     fn get_enum_name_by_index(&self, i: i32) -> Option<&str> { None }
     fn enum_proto(&self) -> Option<&EnumProtoPtr> { None } // only if the field stores an enum
     fn is_message(&self) -> bool { false }
+    // the type name was not found among the messages and enums (e.g. a missing import)
+    fn is_unresolved(&self) -> bool { false }
     fn link_user_types(&self, _: &Vec<EnumProtoPtr>, _: &Vec<MessageProtoPtr>) {}
 }
 
@@ -253,20 +261,19 @@ impl FieldProto for UInt32FieldProto {
 
 pub struct SInt32FieldProto(pub CommonFieldProto);
 impl SInt32FieldProto {
-    pub const MIN: i32 = -0x7fff_ffff;
-    pub const MAX: i32 = 0x7fff_ffff;
+    pub const MIN: i32 = i32::MIN;
+    pub const MAX: i32 = i32::MAX;
 }
 
 impl FieldProto for SInt32FieldProto {
     fn read(&self, reader: &mut dyn PbReaderTrait, limit: &mut u32, field_len: u32) -> io::Result<ScalarValue> {
+        // a value written as 64 bits is truncated, like other implementations do
         let zigzag = reader.read_varint(limit)?;
-        let value = if 0 != (zigzag & 1) { -((zigzag >> 1) & 0x7fffffff) } else { (zigzag >> 1) & 0x7fffffff } as i32;
-        Ok(ScalarValue::S32(value))
+        Ok(ScalarValue::S32(unzigzag32(zigzag as u32)))
     }
     fn write(&self, writer: &mut dyn io::Write, data: &ScalarValue) -> io::Result<()> {
         if let ScalarValue::S32(value) = data {
-            let zigzag = if *value >= 0 { *value << 1 } else { 1 + ((-*value) << 1) };
-            return CommonFieldProto::write_varint(writer, zigzag as u32 as i128);
+            return CommonFieldProto::write_varint(writer, zigzag32(*value) as i128);
         }
         unreachable!()
     }
@@ -387,19 +394,17 @@ impl FieldProto for UInt64FieldProto {
 
 pub struct SInt64FieldProto(pub CommonFieldProto);
 impl SInt64FieldProto {
-    pub const MIN: i64 = -0x7fff_ffff_ffff_ffff;
-    pub const MAX: i64 = 0x7fff_ffff_ffff_ffff;
+    pub const MIN: i64 = i64::MIN;
+    pub const MAX: i64 = i64::MAX;
 }
 impl FieldProto for SInt64FieldProto {
     fn read(&self, reader: &mut dyn PbReaderTrait, limit: &mut u32, field_len: u32) -> io::Result<ScalarValue> {
         let zigzag = reader.read_varint(limit)?;
-        let value = if 0 != (zigzag & 1) { -(zigzag >> 1) } else { zigzag >> 1 } as i64;
-        Ok(ScalarValue::S64(value))
+        Ok(ScalarValue::S64(unzigzag64(zigzag as u64)))
     }
     fn write(&self, writer: &mut dyn io::Write, data: &ScalarValue) -> io::Result<()> {
         if let ScalarValue::S64(value) = data {
-            let zigzag = if *value >= 0 { *value << 1 } else { 1 + ((-*value) << 1) };
-            return CommonFieldProto::write_varint(writer, zigzag as u64 as i128);
+            return CommonFieldProto::write_varint(writer, zigzag64(*value) as i128);
         }
         unreachable!()
     }
@@ -593,7 +598,7 @@ impl UnknownFieldDefinition {
     }
 
     pub fn read_unknown(reader: &mut dyn PbReaderTrait, limit: &mut u32, tlv: Tag) -> io::Result<ScalarValue> {
-        if tlv.length == 0 {
+        if tlv.wire_type() == WT_VARINT { // not by the length: an empty LEN field has zero length too
             let value = reader.read_varint(limit)? as i64;
             let mut vec: Vec<u8> = value.to_le_bytes().into();
             while vec.last() == Some(&0) { // remove insignificant zeroes
@@ -685,6 +690,7 @@ impl FieldProto for EnumOrMessageFieldDefinition {
     }
     fn get_common_definition(&self) -> &CommonFieldProto { &self.common }
     fn is_message(&self) -> bool { self.is_message.get().is_some() }
+    fn is_unresolved(&self) -> bool { self.is_message.get().is_none() && self.enum_proto.get().is_none() }
     fn enum_proto(&self) -> Option<&EnumProtoPtr> { self.enum_proto.get() }
     fn get_enum_name_by_index(&self, i: i32) -> Option<&str> {
         for v in &self.enum_proto.get()?.variants {

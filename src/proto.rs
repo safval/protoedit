@@ -44,7 +44,7 @@ pub struct EnumProto {
 
 impl ProtoData {
     pub fn new(input: &str) -> io::Result<ProtoData> {
-        match PBParser::parse(Rule::file, input) {
+        match PBParser::parse(Rule::file, &strip_block_comments(input)) {
             Ok(rules_pairs) => {
                 let proto_data = ProtoData::from_pairs(rules_pairs);
                 Ok(proto_data)
@@ -180,7 +180,7 @@ impl ProtoData {
                     let value = it.next().unwrap().as_str().to_string();
                     variants.push((name, value.parse().unwrap(), field_comment.clone()));
                     field_comment.clear();
-                    if let Some(r) = it.next() {
+                    if let Some(r) = it.find(|r| r.as_rule() != Rule::field_options) {
                         if r.as_rule() == Rule::COMMENT {
                             if !field_comment.is_empty() { field_comment += "\n"; }
                             field_comment += r.as_span().as_str().trim_start_matches("//");
@@ -230,7 +230,7 @@ impl ProtoData {
                     id = pair.as_span().as_str().parse().unwrap();
                 }
                 Rule::COMMENT | //=> { comments = comments + pair.as_span().as_str(); }
-                Rule::option | Rule::EOI => {}
+                Rule::option | Rule::field_options | Rule::EOI => {}
                 _ => {
                     panic!("Unknown field rule: {:?}", pair.as_rule());
                 }
@@ -423,6 +423,45 @@ impl Debug for EnumProto {
 }
 
 
+// replace /* */ comments with spaces keeping the line breaks, so the parser does not
+// see them and the positions in its errors stay right; `//` comments and string
+// literals are left as they are
+fn strip_block_comments(text: &str) -> String {
+    let mut res = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut quote: Option<char> = None; // inside a string literal
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            res.push(c);
+            if c == '\\' {
+                if let Some(escaped) = chars.next() { res.push(escaped) }
+            } else if c == q { quote = None }
+        } else if c == '"' || c == '\'' {
+            quote = Some(c);
+            res.push(c);
+        } else if c == '/' && chars.peek() == Some(&'/') { // a line comment
+            res.push(c);
+            while let Some(&next) = chars.peek() {
+                if next == '\n' { break }
+                res.push(next);
+                chars.next();
+            }
+        } else if c == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            res.push_str("  ");
+            let mut prev = ' ';
+            while let Some(next) = chars.next() {
+                res.push(if next == '\n' { '\n' } else { ' ' });
+                if prev == '*' && next == '/' { break }
+                prev = next;
+            }
+        } else {
+            res.push(c);
+        }
+    }
+    res
+}
+
 impl ProtoFile {
     fn new(path: PathBuf) -> ProtoFile {
         let content = std::fs::read_to_string(&path).unwrap();
@@ -450,7 +489,7 @@ impl ProtoFile {
 
     fn extract_imports(&self) -> Vec<(String, bool)> { // (file_name, is_public)
         let mut res = vec![];
-        for line in self.content.lines() {
+        for line in strip_block_comments(&self.content).lines() {
             let lise_string = line.to_string();
             let s = lise_string.trim();
             if s.starts_with("import") { // import "file_path.proto";
@@ -611,6 +650,60 @@ mod parsing {
         assert!(proto.get_message_definition("int32,fixed32").is_some());
     }
 
+
+    #[test]
+    fn block_comments_stripped() {
+        // the line breaks and the length are kept, strings and line comments are not touched
+        assert_eq!(strip_block_comments("a /* b\nc */ d"), "a     \n     d");
+        assert_eq!(strip_block_comments("/**/x"), "    x");
+        assert_eq!(strip_block_comments("s = \"/* not */\"; // /* not"), "s = \"/* not */\"; // /* not");
+
+        let proto_str = r#"
+/* a block comment
+   before a message */
+message TestMessage {
+  int32 a = 1; /* after a field */
+  /** a doc comment */
+  int32 b = 2;
+}
+"#;
+        let proto = ProtoData::new(proto_str).unwrap().finalize().unwrap();
+        let msg = proto.auto_detect_root_message().unwrap();
+        assert_eq!(msg.fields.len(), 2);
+    }
+
+    #[test]
+    fn proto2_required_read_as_optional() {
+        let proto_str = "syntax = \"proto2\";\nmessage M { required int32 a = 1; optional int32 b = 2; repeated int32 c = 3; }";
+        let proto = ProtoData::new(proto_str).unwrap().finalize().unwrap();
+        let msg = proto.auto_detect_root_message().unwrap();
+        assert!(!msg.fields[0].repeated());
+        assert!(!msg.fields[1].repeated());
+        assert!(msg.fields[2].repeated());
+    }
+
+    #[test]
+    fn field_options_skipped() {
+        let proto_str = r#"
+message M {
+  int32 a = 1 [default = -1];
+  string b = 2 [json_name = "the_b", deprecated = true];
+  int32 c = 3 [(my.option) = 1.5];
+  string d = 4 [(doc) = "see http://example.com/a]b"];
+  int32 e = 5;
+}
+enum E {
+  E0 = 0 [deprecated = true];
+  //comment of E1
+  E1 = 1;
+}
+"#;
+        let proto = ProtoData::new(proto_str).unwrap().finalize().unwrap();
+        let msg = proto.auto_detect_root_message().unwrap();
+        assert_eq!(msg.fields.len(), 5);
+        assert_eq!(proto.enums[0].variants.len(), 2);
+        assert_eq!(proto.enums[0].variants[1].2, "comment of E1");
+    }
 
     #[test]
     fn comments() {
